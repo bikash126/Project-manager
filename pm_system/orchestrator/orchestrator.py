@@ -1,6 +1,6 @@
 """PM Orchestrator — owns the project state machine (design doc §1, §3).
 
-Phase 2 state machine:
+Phase 3 state machine:
 
     intake (Analyst -> PRD, validated)
     -> scope (Product Owner -> backlog / MVP / cut list)
@@ -11,9 +11,16 @@ Phase 2 state machine:
          approval  -> PRD, backlog, WBS, and plan flip draft -> approved
     -> architecture (Architect -> design doc, ADRs, contracts, data model)
       -> [HUMAN GATE 2: design]   (config.gate2_enabled)
-    -> per-ticket loop (tickets derived from the sprint plan), retry cap 3:
-         Developer -> sandboxed unit tests -> QA -> sandboxed acceptance tests
-    -> done (status digest with cost summary)
+    -> per-ticket loop (tickets from the sprint plan), bounded retry cap 3:
+         Developer -> unit tests -> Security scan (blocking, pre-review)
+                   -> Review (approve/block) -> QA (acceptance tests)
+         each block/failure -> targeted feedback to the Developer, retry
+         cap reached -> escalate to human, PR closed, WIP left on the branch
+    -> done (status digest with cost + PR-pass-rate summary)
+
+Security runs before Review (exit criterion: findings caught pre-review) and
+its verdict is block/pass (D7): a confirmed finding at or above the blocking
+severity blocks, regardless of the agent's opinion. Each ticket is a PR.
 
 The orchestrator never writes code, designs, or docs itself; it curates
 context packages, validates outputs, enforces gates/retries/budgets/context
@@ -34,6 +41,8 @@ from pm_system.agents.estimator import EstimatorAgent
 from pm_system.agents.planner import PlannerAgent
 from pm_system.agents.product_owner import ProductOwnerAgent
 from pm_system.agents.qa import QAAgent
+from pm_system.agents.reviewer import ReviewerAgent
+from pm_system.agents.security import SecurityAgent
 from pm_system.artifacts.store import Artifact, ArtifactStatus, ArtifactStore
 from pm_system.config import OrchestratorConfig
 from pm_system.costs.ledger import CostLedger
@@ -47,6 +56,7 @@ from pm_system.gates.gate import HumanGate
 from pm_system.llm.client import CostTags
 from pm_system.notify.notifier import ConsoleNotifier, Notifier
 from pm_system.orchestrator.git_workspace import GitWorkspace, NullGitWorkspace
+from pm_system.orchestrator.pr import NullPRPublisher, PRPublisher, Verdict
 from pm_system.orchestrator.validation import (
     safe_write,
     topological_order,
@@ -55,10 +65,13 @@ from pm_system.orchestrator.validation import (
     validate_dev_output,
     validate_prd,
     validate_qa_output,
+    validate_review,
+    validate_security_triage,
     validate_sprint_plan,
     validate_wbs,
 )
 from pm_system.sandbox.runner import Sandbox, TestRunner
+from pm_system.security.scanners import SecurityScanSuite, Severity
 
 STAGE_INTAKE = "intake"
 STAGE_SCOPE = "scope"
@@ -68,6 +81,8 @@ STAGE_GATE1 = "gate1"
 STAGE_ARCH = "architecture"
 STAGE_GATE2 = "gate2"
 STAGE_BUILD = "build"
+STAGE_SECURITY = "security"
+STAGE_REVIEW = "review"
 STAGE_QA = "qa"
 STAGE_DONE = "done"
 
@@ -98,6 +113,11 @@ class TicketResult:
     attempts: int
     branch: str | None = None
     detail: str = ""
+    pr_number: int | None = None
+    security_findings: int = 0  # findings surfaced across all attempts
+    security_blocks: int = 0  # attempts blocked by a confirmed finding
+    review_blocks: int = 0  # attempts blocked by the Reviewer
+    qa_failures: int = 0  # attempts failed at QA acceptance tests
 
 
 @dataclass
@@ -110,6 +130,13 @@ class ProjectResult:
     first_try_validation_rate: float | None = None
     total_cost_usd: float = 0.0
     workspace: Path | None = None
+    # Phase 3 metric: share of PRs (tickets) passing Review+QA within the cap.
+    pr_pass_rate: float | None = None
+    security_findings_total: int = 0
+    security_blocks_total: int = 0
+
+
+DEFAULT_STANDARDS_PATH = Path(__file__).resolve().parents[2] / "standards" / "coding_standards.md"
 
 
 class Orchestrator:
@@ -128,16 +155,32 @@ class Orchestrator:
         gate: HumanGate,
         sandbox: Sandbox,
         workspace_root: Path,
+        reviewer: ReviewerAgent | None = None,
+        security: SecurityAgent | None = None,
+        scan_suite: SecurityScanSuite | None = None,
+        pr_publisher: PRPublisher | None = None,
         gate2: HumanGate | None = None,
         notifier: Notifier | None = None,
         config: OrchestratorConfig | None = None,
         test_python: str = "python",
+        standards_path: Path | None = None,
     ):
-        if developer.llm is qa.llm or developer.llm.client is qa.llm.client:
-            raise ValueError(
-                "design decision D3: QA must run on a separate model instance "
-                "from the Developer (pass distinct LLM clients)"
-            )
+        self.config = config or OrchestratorConfig()
+        # D3: QA, Reviewer, and Security must each be a separate model instance
+        # from the Developer — fresh context, adversarial framing.
+        for role, agent in (("QA", qa), ("Reviewer", reviewer), ("Security", security)):
+            if agent is None:
+                continue
+            if developer.llm is agent.llm or developer.llm.client is agent.llm.client:
+                raise ValueError(
+                    f"design decision D3: {role} must run on a separate model "
+                    "instance from the Developer (pass distinct LLM clients)"
+                )
+        if self.config.enable_review and reviewer is None:
+            raise ValueError("enable_review is set but no reviewer agent was provided")
+        if self.config.enable_security and security is None:
+            raise ValueError("enable_security is set but no security agent was provided")
+
         self.store = store
         self.ledger = ledger
         self.analyst = analyst
@@ -147,14 +190,20 @@ class Orchestrator:
         self.architect = architect
         self.developer = developer
         self.qa = qa
+        self.reviewer = reviewer
+        self.security = security
+        self.scan_suite = scan_suite or SecurityScanSuite()
+        self.pr_publisher = pr_publisher or NullPRPublisher()
         self.gate = gate
         self.gate2 = gate2 or gate
         self.workspace_root = Path(workspace_root)
         self.notifier = notifier or ConsoleNotifier()
-        self.config = config or OrchestratorConfig()
         self.test_runner = TestRunner(
             sandbox, python=test_python, timeout=self.config.sandbox_timeout
         )
+        self.blocking_severity = Severity.parse(self.config.blocking_severity, Severity.HIGH)
+        path = standards_path or DEFAULT_STANDARDS_PATH
+        self.standards = path.read_text() if path.exists() else ""
         self.tracker = ValidationTracker()
         self._versions: dict[str, int] = {}
 
@@ -472,11 +521,27 @@ class Orchestrator:
         branch = f"ticket/{ticket_id}"
         ac_ids = {ac["id"] for ac in ticket["acceptance_criteria"]}
         workspace.start_ticket_branch(branch)
+        pr = self.pr_publisher.open_pr(
+            ticket_id=ticket_id,
+            branch=branch,
+            title=f"{ticket_id}: {ticket['story']}",
+            body=f"Implements {ticket['story_id']} / {ticket['wbs_id']}.\n\n{ticket['description']}",
+        )
+        result = TicketResult(
+            ticket_id=ticket_id,
+            story_id=ticket["story_id"],
+            status="escalated",
+            attempts=0,
+            branch=branch,
+            pr_number=pr.number,
+        )
         dev_feedback: str | None = None
         last_failure = ""
 
         for attempt in range(1, self.config.max_retries + 1):
-            self._notify(project_id, STAGE_BUILD, f"{ticket_id} attempt {attempt}")
+            result.attempts = attempt
+            passed_review: dict | None = None
+            self._notify(project_id, STAGE_BUILD, f"{ticket_id} attempt {attempt} (PR #{pr.number})")
 
             # --- Developer
             dev_out, defects = None, []
@@ -486,7 +551,8 @@ class Orchestrator:
                         instructions=(
                             f"Implement ticket {ticket_id}. Deliver production code plus "
                             "unit tests as repo-relative files (tests under tests/). "
-                            "Follow the attached architecture slices. "
+                            "Follow the attached architecture slices and the coding "
+                            "standards. Never hardcode secrets. "
                             "The full pytest suite of the workspace must pass."
                         ),
                         artifacts={
@@ -500,8 +566,8 @@ class Orchestrator:
             except AgentOutputError as exc:
                 defects = exc.defects
             except ContextOverflowError as exc:
-                return self._escalate_ticket(project_id, workspace, ticket, branch,
-                                             attempt, f"context cap exceeded: {exc}")
+                return self._escalate_ticket(project_id, workspace, pr, result,
+                                             f"context cap exceeded: {exc}")
             if dev_out is not None:
                 defects = defects + validate_dev_output(dev_out, ticket_id)
             if attempt == 1:
@@ -520,6 +586,43 @@ class Orchestrator:
                 dev_feedback = last_failure
                 self._notify(project_id, STAGE_BUILD, f"{ticket_id} unit tests failed")
                 continue
+
+            diff = self._diff(dev_out)
+
+            # --- Security scan (deterministic detection + agent triage), pre-review
+            if self.config.enable_security:
+                try:
+                    blocked, security_report, n_findings = self._security_step(
+                        project_id, ticket, workspace, diff, pr
+                    )
+                except ContextOverflowError as exc:
+                    return self._escalate_ticket(project_id, workspace, pr, result,
+                                                 f"context cap exceeded: {exc}")
+                result.security_findings += n_findings
+                if blocked:
+                    result.security_blocks += 1
+                    last_failure = security_report
+                    dev_feedback = security_report
+                    self._notify(project_id, STAGE_SECURITY, f"{ticket_id} blocked by security")
+                    continue
+
+            # --- Review (separate model instance, adversarial), pre-QA
+            if self.config.enable_review:
+                try:
+                    review = self._review_step(project_id, ticket_id, diff, pr, attempt)
+                except ContextOverflowError as exc:
+                    return self._escalate_ticket(project_id, workspace, pr, result,
+                                                 f"context cap exceeded: {exc}")
+                if review is None:  # invalid review output; burn attempt
+                    last_failure = "Reviewer output was invalid"
+                    continue
+                if review["verdict"] == "block":
+                    result.review_blocks += 1
+                    last_failure = self._format_review(review)
+                    dev_feedback = last_failure
+                    self._notify(project_id, STAGE_REVIEW, f"{ticket_id} blocked by review")
+                    continue
+                passed_review = review
 
             # --- QA (separate model instance, deterministic verdict from the test run)
             qa_out, qa_defects = None, []
@@ -543,8 +646,8 @@ class Orchestrator:
             except AgentOutputError as exc:
                 qa_defects = exc.defects
             except ContextOverflowError as exc:
-                return self._escalate_ticket(project_id, workspace, ticket, branch,
-                                             attempt, f"context cap exceeded: {exc}")
+                return self._escalate_ticket(project_id, workspace, pr, result,
+                                             f"context cap exceeded: {exc}")
             if qa_out is not None:
                 qa_defects = qa_defects + validate_qa_output(qa_out, ticket_id, ac_ids)
             if attempt == 1:
@@ -559,52 +662,151 @@ class Orchestrator:
                 safe_write(workspace.root, file["path"], file["content"])
 
             acceptance = self.test_runner.run(workspace.root)
-            if acceptance.passed:
-                workspace.commit_all(f"{ticket_id}: implement {ticket['story_id']}")
-                workspace.merge_ticket_branch(branch)
-                self._record_ticket_artifacts(project_id, ticket, dev_out, qa_out, acceptance.summary)
-                self._notify(project_id, STAGE_QA, f"{ticket_id} passed QA on attempt {attempt}")
-                return TicketResult(
-                    ticket_id=ticket_id,
-                    story_id=ticket["story_id"],
-                    status="passed",
-                    attempts=attempt,
-                    branch=branch,
+            if not acceptance.passed:
+                result.qa_failures += 1
+                last_failure = (
+                    f"QA acceptance tests failed (exit {acceptance.exit_code}) — bug report:\n"
+                    f"{acceptance.summary}"
                 )
+                dev_feedback = last_failure
+                self.pr_publisher.post_verdict(
+                    pr, Verdict("qa", "fail", acceptance.summary[-500:])
+                )
+                self._notify(project_id, STAGE_QA, f"{ticket_id} acceptance tests failed")
+                continue
 
-            last_failure = (
-                f"QA acceptance tests failed (exit {acceptance.exit_code}) — bug report:\n"
-                f"{acceptance.summary}"
+            # --- all gates green
+            workspace.commit_all(f"{ticket_id}: implement {ticket['story_id']}")
+            workspace.merge_ticket_branch(branch)
+            self.pr_publisher.post_verdict(pr, Verdict("qa", "pass"))
+            self.pr_publisher.merge_pr(pr)
+            self._record_ticket_artifacts(
+                project_id, ticket, dev_out, qa_out, acceptance.summary,
+                review=passed_review,
             )
-            dev_feedback = last_failure
-            self._notify(project_id, STAGE_QA, f"{ticket_id} acceptance tests failed")
+            result.status = "passed"
+            self._notify(
+                project_id, STAGE_QA,
+                f"{ticket_id} passed Review+QA on attempt {attempt}; PR #{pr.number} merged",
+            )
+            return result
 
-        return self._escalate_ticket(
-            project_id, workspace, ticket, branch, self.config.max_retries, last_failure
+        return self._escalate_ticket(project_id, workspace, pr, result, last_failure)
+
+    def _security_step(self, project_id, ticket, workspace, diff, pr):
+        """Run scanners, triage findings, return (blocked, report, n_findings).
+
+        Zero findings -> pass without invoking the model (cost control).
+        A confirmed finding at/above the blocking severity blocks (D7).
+        """
+        ticket_id = ticket["ticket_id"]
+        scan = self.scan_suite.scan(workspace.root, self.test_runner.sandbox,
+                                    timeout=self.config.sandbox_timeout)
+        if not scan.has_findings:
+            self.pr_publisher.post_verdict(pr, Verdict("security", "pass", "no findings"))
+            return False, "", 0
+
+        ids = {f"FND-{i:03d}": finding for i, finding in enumerate(scan.findings, start=1)}
+        rendered = "\n".join(f.render(fid) for fid, f in ids.items())
+        triage = self.security.run(
+            ContextPackage(
+                instructions=(
+                    f"Triage the security scanner findings for ticket {ticket_id}. "
+                    "For each finding, decide 'confirmed' or 'false_positive'; a "
+                    "false positive needs a written reason. Add threat-model notes."
+                ),
+                artifacts={"findings": rendered, "diff": diff},
+            ),
+            CostTags(project_id=project_id, stage=STAGE_SECURITY, agent="security", ticket_id=ticket_id),
         )
+        defects = validate_security_triage(triage, set(ids))
+        if defects:
+            report = "Security triage was invalid:\n" + "\n".join(f"- {d}" for d in defects)
+            self.pr_publisher.post_verdict(pr, Verdict("security", "block", report))
+            return True, report, len(ids)
 
-    def _escalate_ticket(
-        self, project_id, workspace, ticket, branch, attempts, detail
-    ) -> TicketResult:
-        workspace.abandon_ticket_branch(branch)
+        confirmed = {
+            t["finding_id"] for t in triage["triage"] if t["status"] == "confirmed"
+        }
+        blocking = [
+            (fid, ids[fid])
+            for fid in confirmed
+            if ids[fid].severity >= self.blocking_severity
+        ]
+        if blocking:
+            lines = [ids[fid].render(fid) for fid, _ in sorted(blocking)]
+            report = (
+                "Security scan blocked this PR — fix these confirmed findings:\n"
+                + "\n".join(lines)
+            )
+            self.pr_publisher.post_verdict(pr, Verdict("security", "block", report))
+            return True, report, len(ids)
+
+        self.pr_publisher.post_verdict(
+            pr, Verdict("security", "pass", f"{len(ids)} finding(s), none blocking")
+        )
+        return False, "", len(ids)
+
+    def _review_step(self, project_id, ticket_id, diff, pr, attempt):
+        try:
+            review = self.reviewer.run(
+                ContextPackage(
+                    instructions=(
+                        f"Review the diff for ticket {ticket_id} against the coding "
+                        "standards. Be adversarial — you did not write this code. "
+                        "Approve only if it meets the bar; block with major/blocker "
+                        "comments otherwise."
+                    ),
+                    artifacts={"diff": diff, "coding_standards": self.standards},
+                ),
+                CostTags(project_id=project_id, stage=STAGE_REVIEW, agent="reviewer", ticket_id=ticket_id),
+            )
+        except AgentOutputError:
+            if attempt == 1:
+                self.tracker.record("review", False)
+            return None
+        defects = validate_review(review)
+        if attempt == 1:
+            self.tracker.record("review", not defects)
+        if defects:
+            return None
+        self.pr_publisher.post_verdict(
+            pr, Verdict("reviewer", review["verdict"], self._format_review(review))
+        )
+        return review
+
+    @staticmethod
+    def _diff(dev_out: dict) -> list[dict]:
+        """The review/scan surface: the files this ticket's developer produced."""
+        return [{"path": f["path"], "content": f["content"]} for f in dev_out["files"]]
+
+    @staticmethod
+    def _format_review(review: dict) -> str:
+        if not review["comments"]:
+            return f"Review verdict: {review['verdict']}"
+        lines = [f"Review verdict: {review['verdict']}. Comments:"]
+        for c in review["comments"]:
+            lines.append(f"- [{c['severity']}] {c['path']}: {c['comment']}")
+        return "\n".join(lines)
+
+    def _escalate_ticket(self, project_id, workspace, pr, result: TicketResult, detail) -> TicketResult:
+        workspace.abandon_ticket_branch(result.branch)
+        self.pr_publisher.close_pr(pr, f"escalated after {result.attempts} attempt(s)")
+        result.status = "escalated"
+        result.detail = detail
         self._notify(
             project_id,
             STAGE_BUILD,
-            f"{ticket['ticket_id']} ESCALATED to human after {attempts} attempt(s) "
-            f"(WIP left on {branch})",
+            f"{result.ticket_id} ESCALATED to human after {result.attempts} attempt(s) "
+            f"(PR #{pr.number} closed, WIP left on {result.branch})",
         )
-        return TicketResult(
-            ticket_id=ticket["ticket_id"],
-            story_id=ticket["story_id"],
-            status="escalated",
-            attempts=attempts,
-            branch=branch,
-            detail=detail,
-        )
+        return result
 
     # ------------------------------------------------------------- helpers
 
-    def _record_ticket_artifacts(self, project_id, ticket, dev_out, qa_out, test_summary) -> None:
+    def _record_ticket_artifacts(
+        self, project_id, ticket, dev_out, qa_out, test_summary, review=None
+    ) -> None:
         ticket_id = ticket["ticket_id"]
         ac_ids = [ac["id"] for ac in ticket["acceptance_criteria"]]
         code_id = f"{project_id}:CODE-{ticket_id}"
@@ -621,6 +823,17 @@ class Orchestrator:
             trace_ids=[ticket_id, ticket["wbs_id"], ticket["story_id"]],
         )
         self.store.set_status(code_id, ArtifactStatus.APPROVED)
+        if review is not None:
+            review_id = f"{project_id}:REVIEW-{ticket_id}"
+            self.store.put(
+                review_id,
+                artifact_type="review",
+                content={"ticket_id": ticket_id, **review},
+                created_by="reviewer",
+                project_id=project_id,
+                trace_ids=[ticket_id, ticket["story_id"]],
+            )
+            self.store.set_status(review_id, ArtifactStatus.APPROVED)
         qa_id = f"{project_id}:QA-{ticket_id}"
         self.store.put(
             qa_id,
@@ -704,15 +917,24 @@ class Orchestrator:
     def _finish(self, result: ProjectResult) -> ProjectResult:
         result.first_try_validation_rate = self.tracker.first_try_rate
         result.total_cost_usd = self.ledger.project_spend(result.project_id)
+        result.security_findings_total = sum(t.security_findings for t in result.tickets)
+        result.security_blocks_total = sum(t.security_blocks for t in result.tickets)
+        if result.tickets:
+            passed = sum(1 for t in result.tickets if t.status == "passed")
+            result.pr_pass_rate = passed / len(result.tickets)
         rate = (
             "n/a"
             if result.first_try_validation_rate is None
             else f"{result.first_try_validation_rate:.0%}"
         )
+        pr_rate = "n/a" if result.pr_pass_rate is None else f"{result.pr_pass_rate:.0%}"
         self._notify(
             result.project_id,
             STAGE_DONE,
             f"project {result.status}; {len(result.tickets)} tickets; "
+            f"PR pass rate (Review+QA within {self.config.max_retries}) {pr_rate}; "
+            f"security findings {result.security_findings_total} "
+            f"({result.security_blocks_total} blocking); "
             f"first-try validation rate {rate}; "
             f"total cost ${result.total_cost_usd:.4f}; "
             f"per stage: {self.ledger.summary(result.project_id)}",

@@ -1,13 +1,36 @@
-# Multi-Agent Software Development PM System — Phases 1–2
+# Multi-Agent Software Development PM System — Phases 1–3
 
-Phases 1 and 2 of the [design document](https://app.notion.com/p/39ad619bbee38114b98cff069085958a):
-a PM Orchestrator plus seven specialist agents that take a raw project idea
+Phases 1–3 of the [design document](https://app.notion.com/p/39ad619bbee38114b98cff069085958a):
+a PM Orchestrator plus nine specialist agents that take a raw project idea
 through the upstream pipeline — PRD → prioritized backlog/MVP → WBS +
 estimates → sprint plan → **Gate 1** → architecture/ADRs → **Gate 2** — and
-then through the per-ticket build/QA loop, on a toy project, with the
-foundations the design says must exist from day one: versioned artifact store
-with a status lifecycle, cost ledger, sandbox platform, and (since Phase 2)
-the agent eval harness.
+then through the per-ticket quality loop `Dev → Security → Review → QA`, each
+ticket a PR, on a toy project, with the foundations the design says must exist
+from day one: versioned artifact store with a status lifecycle, cost ledger,
+sandbox platform, and the agent eval harness.
+
+## What's implemented — Phase 3 (quality + security loop)
+
+| Design element | Where | Notes |
+|---|---|---|
+| Reviewer agent | `pm_system/agents/reviewer.py` | PR diff + standards doc → comments + approve/block; separate model instance (D3) |
+| Security agent | `pm_system/agents/security.py` | Triages scanner findings (confirmed/false-positive + reason) + threat-model notes; separate instance |
+| Deterministic security stack | `pm_system/security/scanners.py` | SAST (Semgrep), secrets (Gitleaks), deps (pip-audit) run in the sandbox + a built-in regex secret scanner that always works offline; findings normalized with a comparable severity |
+| Restructured per-ticket loop | `pm_system/orchestrator/orchestrator.py` | `Dev → unit tests → Security (pre-review, blocking) → Review → QA`, bounded at 3 retries; each block/failure routes targeted feedback to the Developer |
+| Block/pass security verdict (D7) | `_security_step` | The orchestrator, not the agent, computes the verdict: a **confirmed** finding at/above `blocking_severity` blocks — the agent can only exclude one by marking it a false positive *with a reason* (auditable); it cannot downgrade a real finding |
+| Security is pre-review | loop ordering | Exit criterion "findings caught pre-review": Review runs only after Security passes |
+| Real GitHub PRs | `pm_system/orchestrator/pr.py` | `PRPublisher` abstraction: `GitHubPRPublisher` (REST API) + `NullPRPublisher` default; a PR per ticket carries the Security/Review/QA verdicts, merges on green, closes on escalation |
+| Coding standards doc | `standards/coding_standards.md` | The KB standards doc the Reviewer checks against (a versioned artifact) |
+| P3 metric | `ProjectResult.pr_pass_rate` | Share of PRs passing Review+QA within the retry cap; reported in the final digest alongside security-finding counts |
+| P1/P3 playbooks | `playbooks/{reviewer,security}.md` | Review checklist + severity taxonomy; threat-model triage + false-positive protocol |
+| Egress allowlist proxy | `pm_system/sandbox/egress_proxy.py` | Now backs the security-tool network needs: allowlist mode lets scanners reach only approved hosts |
+
+**Phase 3 exit criteria:** the toy project runs the full `Dev → Security →
+Review → QA` loop with each ticket as a merged PR (`python -m
+examples.run_toy_project` — 100% PR pass rate); and security findings are
+caught pre-review — `--inject-secret` plants a hardcoded key, the Security
+gate blocks it before the Reviewer is ever called, and the fixed retry merges
+(`tests/test_toy_project.py`, `tests/test_phase3_loop.py`).
 
 ## What's implemented — Phase 2 (upstream + PO)
 
@@ -49,8 +72,8 @@ eval suites exist for all four Phase-2 agents (`pm_system/evals/golden.py`).
 | P0 playbooks | `playbooks/{analyst,developer,qa}.md` | Role definition, procedure, template, checklist, failure patterns, escalation rules |
 | Model tiering | `pm_system/config.py`, `pm_system/llm/client.py` | Strong/mid/cheap tiers, per-family pricing for the ledger |
 
-Deliberately **not** built yet (later phases per the build plan): Reviewer +
-security stack + real GitHub PRs (Phase 3), ship path (4), change management /
+Deliberately **not** built yet (later phases per the build plan): ship path —
+DevOps/Release/Docs/Data Engineer + Gate 3 (Phase 4), change management /
 `stale` propagation (5), Knowledge Base + retrospectives (6), UX/UI + parallel
 dev (7). The hooks they need already exist: `kb_calibration`/`kb_adrs` inputs,
 the `stale` status, the traceability index, and Gate 3 is one more
@@ -66,16 +89,20 @@ the `stale` status, the traceability index, and Gate 3 is one more
   `first_try_validation_rate` in the final digest/result.
 - **P2 — full plan for a small project, Gate 1 functioning, eval suites for
   all Phase-2 agents** — see the Phase 2 table above.
+- **P3 — PRs pass Review+QA within 3 retries (≥ 70%), security findings caught
+  pre-review** — reported as `pr_pass_rate`; the `--inject-secret` run shows
+  the Security gate blocking before Review.
 
 ## Quickstart
 
 ```bash
 pip install -e ".[dev]"          # + [llm] for Anthropic, + [slack] for Slack
-python -m pytest                 # 78 tests
+python -m pytest                 # 108 tests
 python -m examples.run_toy_project --sandbox local   # offline, scripted LLM
+python -m examples.run_toy_project --sandbox local --inject-secret  # security gate demo
 
-# eval the Phase-2 agents against real models (gates prompt/playbook changes)
-ANTHROPIC_API_KEY=... python -m pm_system.evals.run --role architect
+# eval the planning/review/security agents against real models (gates prompt changes)
+ANTHROPIC_API_KEY=... python -m pm_system.evals.run --role reviewer --role security
 ```
 
 The demo uses `MockLLM` (deterministic, offline) — the generated code is real
@@ -84,9 +111,9 @@ and executes in the sandbox. To run against real models, build the agents with
 
 ```python
 from pm_system import (AnalystAgent, AnthropicLLM, ArchitectAgent, ArtifactStore,
-                       CostLedger, DeveloperAgent, EstimatorAgent, MeteredLLM,
-                       Orchestrator, PlannerAgent, ProductOwnerAgent, QAAgent,
-                       SlackGate, default_sandbox)
+                       CostLedger, DeveloperAgent, EstimatorAgent, GitHubPRPublisher,
+                       MeteredLLM, Orchestrator, PlannerAgent, ProductOwnerAgent,
+                       QAAgent, ReviewerAgent, SecurityAgent, SlackGate, default_sandbox)
 from pm_system.config import MID_MODEL, STRONG_MODEL
 
 ledger = CostLedger("costs.db", stage_budgets={"intake": 5, "build": 20, "qa": 10})
@@ -101,8 +128,11 @@ orchestrator = Orchestrator(
     planner=PlannerAgent(llm(), model=MID_MODEL),
     architect=ArchitectAgent(llm(), model=STRONG_MODEL),
     developer=DeveloperAgent(llm(), model=STRONG_MODEL),
+    reviewer=ReviewerAgent(llm(), model=STRONG_MODEL),   # separate instance (D3)
+    security=SecurityAgent(llm(), model=STRONG_MODEL),   # separate instance (D3)
     qa=QAAgent(llm(), model=STRONG_MODEL),
     gate=SlackGate(token="xoxb-...", channel="#pm-gates"),
+    pr_publisher=GitHubPRPublisher(owner="acme", repo="widget", token="ghp_..."),
     sandbox=default_sandbox(), workspace_root=Path("workspaces"),
 )
 result = orchestrator.run_project("my-project", "Build a ...",
@@ -133,17 +163,19 @@ internal networks have no external route.
 
 ```
 pm_system/
-  orchestrator/   state machine, handoff validation, git workspace
-  agents/         base + analyst/PO/estimator/planner/architect/developer/qa
+  orchestrator/   state machine, handoff validation, git workspace, PR publisher
+  agents/         base + analyst/PO/estimator/planner/architect/developer/reviewer/security/qa
   artifacts/      versioned store with status lifecycle + traceability index
   costs/          cost ledger + budget caps
   llm/            Anthropic/mock clients, metering, pricing
   sandbox/        Docker/local runners, egress policy + proxy, test runner
+  security/       deterministic scanners (SAST/secrets/deps) + severity model
   gates/          Slack/console/auto human gates
   notify/         stage-transition digests (console/Slack)
   evals/          eval harness, golden suites, real-model runner
-playbooks/        analyst, developer, qa, architect, estimator, planner, product_owner
-sandbox/          Dockerfile for the task image
+playbooks/        analyst, developer, qa, architect, estimator, planner, product_owner, reviewer, security
+standards/        coding_standards.md (KB standards doc for the Reviewer)
+sandbox/          Dockerfile for the task image (+ security stack)
 examples/         toy project runner + scripted mock responses
 tests/            unit + end-to-end suite
 ```

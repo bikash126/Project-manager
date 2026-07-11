@@ -18,11 +18,16 @@ from pathlib import Path
 from examples.toy_responses import (
     ANALYST_RESPONSES,
     ARCHITECT_RESPONSES,
+    DEV_TICKET_1,
+    DEV_TICKET_1_INSECURE,
+    DEV_TICKET_2,
     DEVELOPER_RESPONSES,
     ESTIMATOR_RESPONSES,
     PLANNER_RESPONSES,
     PRODUCT_OWNER_RESPONSES,
     QA_RESPONSES,
+    REVIEWER_RESPONSES,
+    SECURITY_CONFIRM,
 )
 from pm_system import (
     AnalystAgent,
@@ -41,6 +46,8 @@ from pm_system import (
     PlannerAgent,
     ProductOwnerAgent,
     QAAgent,
+    ReviewerAgent,
+    SecurityAgent,
 )
 from pm_system.config import MID_MODEL, STRONG_MODEL
 from pm_system.sandbox.runner import DockerSandbox, LocalSandbox, default_sandbox
@@ -56,6 +63,12 @@ def main(argv=None) -> int:
         help="docker requires the pm-sandbox:latest image (see sandbox/Dockerfile)",
     )
     parser.add_argument("--workspace", type=Path, default=None)
+    parser.add_argument(
+        "--inject-secret",
+        action="store_true",
+        help="developer hardcodes a secret on the first TCK-001 attempt; the "
+        "Security gate should catch it pre-review, block, and pass on retry",
+    )
     args = parser.parse_args(argv)
 
     workspace_root = args.workspace or Path(tempfile.mkdtemp(prefix="pm-toy-"))
@@ -64,11 +77,13 @@ def main(argv=None) -> int:
     ledger = CostLedger(
         stage_budgets={
             "intake": 5.0, "scope": 5.0, "estimate": 5.0, "plan": 5.0,
-            "architecture": 10.0, "build": 20.0, "qa": 10.0,
+            "architecture": 10.0, "build": 20.0, "security": 10.0,
+            "review": 10.0, "qa": 10.0,
         }
     )
 
-    # One MockLLM per role: QA runs on a separate instance from the Developer (D3).
+    # One MockLLM per role: QA/Reviewer/Security each run on a separate
+    # instance from the Developer (D3).
     def metered(responses):
         return MeteredLLM(MockLLM(responses), ledger)
 
@@ -77,7 +92,16 @@ def main(argv=None) -> int:
     estimator = EstimatorAgent(metered(ESTIMATOR_RESPONSES), model=MID_MODEL)
     planner = PlannerAgent(metered(PLANNER_RESPONSES), model=MID_MODEL)
     architect = ArchitectAgent(metered(ARCHITECT_RESPONSES), model=STRONG_MODEL)
-    developer = DeveloperAgent(metered(DEVELOPER_RESPONSES), model=STRONG_MODEL)
+    if args.inject_secret:
+        dev_responses = [DEV_TICKET_1_INSECURE, DEV_TICKET_1, DEV_TICKET_2]
+        security_responses = [SECURITY_CONFIRM]  # confirms the planted key -> block
+    else:
+        dev_responses = DEVELOPER_RESPONSES
+        security_responses = []  # clean code -> scanners find nothing -> agent unused
+
+    developer = DeveloperAgent(metered(dev_responses), model=STRONG_MODEL)
+    reviewer = ReviewerAgent(metered(REVIEWER_RESPONSES), model=STRONG_MODEL)
+    security = SecurityAgent(metered(security_responses), model=STRONG_MODEL)
     qa = QAAgent(metered(QA_RESPONSES), model=STRONG_MODEL)
 
     if args.sandbox == "local":
@@ -99,6 +123,8 @@ def main(argv=None) -> int:
         planner=planner,
         architect=architect,
         developer=developer,
+        reviewer=reviewer,
+        security=security,
         qa=qa,
         gate=ConsoleGate() if args.gate == "console" else AutoApproveGate(),
         sandbox=sandbox,
@@ -113,9 +139,17 @@ def main(argv=None) -> int:
     print("\n=== Result ===")
     print(f"status: {result.status}")
     for ticket in result.tickets:
-        print(f"  {ticket.ticket_id} ({ticket.story_id}): {ticket.status} in {ticket.attempts} attempt(s)")
+        print(
+            f"  {ticket.ticket_id} ({ticket.story_id}): {ticket.status} in "
+            f"{ticket.attempts} attempt(s), PR #{ticket.pr_number} "
+            f"[sec findings={ticket.security_findings}, review blocks={ticket.review_blocks}, "
+            f"qa fails={ticket.qa_failures}]"
+        )
     rate = result.first_try_validation_rate
-    print(f"first-try validation rate: {'n/a' if rate is None else f'{rate:.0%}'} (exit criterion: >= 80%)")
+    pr_rate = result.pr_pass_rate
+    print(f"first-try validation rate: {'n/a' if rate is None else f'{rate:.0%}'} (P1/P2 exit: >= 80%)")
+    print(f"PR pass rate (Review+QA within 3): {'n/a' if pr_rate is None else f'{pr_rate:.0%}'} (P3 exit: >= 70%)")
+    print(f"security findings: {result.security_findings_total} ({result.security_blocks_total} blocking)")
     print(f"total cost: ${result.total_cost_usd:.4f}")
     print(f"workspace: {result.workspace}")
 

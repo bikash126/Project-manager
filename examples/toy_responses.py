@@ -141,6 +141,47 @@ DEV_TICKET_1 = _fenced(
     }
 )
 
+# An insecure first attempt at TCK-001: hardcodes an AWS key. Used by the
+# --inject-secret demo to show the Security gate blocking pre-review.
+_CONVERT_PY_INSECURE = _CONVERT_PY + '\n# TODO remove\nAWS_KEY = "AKIAIOSFODNN7EXAMPLE1"\n'
+
+DEV_TICKET_1_INSECURE = _fenced(
+    {
+        "ticket_id": "TCK-001",
+        "files": [
+            {
+                "path": "temp_converter/__init__.py",
+                "content": "from temp_converter.convert import ABSOLUTE_ZERO_C, c_to_f, f_to_c\n",
+            },
+            {"path": "temp_converter/convert.py", "content": _CONVERT_PY_INSECURE},
+            {
+                "path": "tests/test_convert.py",
+                "content": (
+                    "from temp_converter import c_to_f, f_to_c\n\n\n"
+                    "def test_c_to_f_boiling():\n"
+                    "    assert c_to_f(100) == 212\n\n\n"
+                    "def test_f_to_c_freezing():\n"
+                    "    assert f_to_c(32) == 0\n"
+                ),
+            },
+        ],
+        "notes": "conversion module",
+    }
+)
+
+SECURITY_CONFIRM = _fenced(
+    {
+        "triage": [
+            {
+                "finding_id": "FND-001",
+                "status": "confirmed",
+                "reason": "hardcoded AWS access key in source",
+            }
+        ],
+        "threat_model_notes": "Leaked credentials allow account takeover; rotate and remove.",
+    }
+)
+
 DEV_TICKET_2 = _fenced(
     {
         "ticket_id": "TCK-002",
@@ -320,10 +361,31 @@ ARCHITECTURE = _fenced(
     }
 )
 
+def _review_approve(ticket_id: str) -> str:
+    return _fenced(
+        {
+            "verdict": "approve",
+            "comments": [
+                {
+                    "path": "temp_converter/",
+                    "severity": "info",
+                    "comment": f"{ticket_id}: clean, standards-compliant, no secrets.",
+                }
+            ],
+        }
+    )
+
+
+REVIEW_TICKET_1 = _review_approve("TCK-001")
+REVIEW_TICKET_2 = _review_approve("TCK-002")
+
 ANALYST_RESPONSES = [PRD]
 PRODUCT_OWNER_RESPONSES = [BACKLOG]
 ESTIMATOR_RESPONSES = [WBS]
 PLANNER_RESPONSES = [SPRINT_PLAN]
 ARCHITECT_RESPONSES = [ARCHITECTURE]
 DEVELOPER_RESPONSES = [DEV_TICKET_1, DEV_TICKET_2]
+REVIEWER_RESPONSES = [REVIEW_TICKET_1, REVIEW_TICKET_2]
+# Security agent is only invoked when scanners find something; the toy code is
+# clean, so no scripted security responses are needed.
 QA_RESPONSES = [QA_TICKET_1, QA_TICKET_2]

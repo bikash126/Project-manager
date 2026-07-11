@@ -207,6 +207,15 @@ class LocalSandbox(Sandbox):
                 text=True,
                 timeout=timeout,
             )
+        except FileNotFoundError:
+            # Binary not installed — mirror the shell's exit 127 so callers
+            # (e.g. optional security scanners) can skip it gracefully.
+            return SandboxResult(
+                exit_code=127,
+                stdout="",
+                stderr=f"{command[0]}: command not found",
+                duration_s=time.monotonic() - start,
+            )
         except subprocess.TimeoutExpired as exc:
             def _text(stream):
                 if stream is None:

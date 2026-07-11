@@ -26,3 +26,7 @@ class OrchestratorConfig:
     project_budget: float | None = None
     sprint_capacity_points: int = 10  # Planner input (Phase 2)
     gate2_enabled: bool = True  # human gate on architecture (D4)
+    # Phase 3 quality + security loop
+    enable_security: bool = True  # run the security scan step (Dev -> Security -> Review -> QA)
+    enable_review: bool = True  # run the Reviewer step
+    blocking_severity: str = "high"  # confirmed findings >= this block the PR (D7)

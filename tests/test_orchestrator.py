@@ -12,6 +12,8 @@ from pm_system.agents.estimator import EstimatorAgent
 from pm_system.agents.planner import PlannerAgent
 from pm_system.agents.product_owner import ProductOwnerAgent
 from pm_system.agents.qa import QAAgent
+from pm_system.agents.reviewer import ReviewerAgent
+from pm_system.agents.security import SecurityAgent
 from pm_system.artifacts.store import ArtifactStatus, ArtifactStore
 from pm_system.config import OrchestratorConfig
 from pm_system.costs.ledger import CostLedger
@@ -20,6 +22,7 @@ from pm_system.llm.client import MeteredLLM, MockLLM
 from pm_system.notify.notifier import NullNotifier
 from pm_system.orchestrator.orchestrator import Orchestrator
 from pm_system.sandbox.runner import LocalSandbox
+from pm_system.security.scanners import RegexSecretScanner, SecurityScanSuite
 
 PRD = json.dumps(
     {
@@ -137,6 +140,18 @@ QA_RESPONSE = json.dumps(
     }
 )
 
+REVIEW_APPROVE = json.dumps(
+    {"verdict": "approve", "comments": [{"path": "greeter.py", "severity": "info", "comment": "ok"}]}
+)
+REVIEW_BLOCK = json.dumps(
+    {
+        "verdict": "block",
+        "comments": [
+            {"path": "greeter.py", "severity": "major", "comment": "missing input validation"}
+        ],
+    }
+)
+
 
 class ScriptedGate(HumanGate):
     def __init__(self, decisions):
@@ -157,7 +172,10 @@ def make_orchestrator(
     planner_responses=None,
     architect_responses=None,
     dev_responses=None,
+    reviewer_responses=None,
+    security_responses=None,
     qa_responses=None,
+    scan_suite=None,
     gate=None,
     gate2=None,
     ledger=None,
@@ -169,6 +187,13 @@ def make_orchestrator(
     def metered(responses):
         return MeteredLLM(MockLLM(responses if responses is not None else []), ledger)
 
+    # Reviewer defaults to always-approve via a handler so tests needn't count calls.
+    reviewer_llm = (
+        metered(reviewer_responses)
+        if reviewer_responses is not None
+        else MeteredLLM(MockLLM(handler=lambda s, p: REVIEW_APPROVE), ledger)
+    )
+
     orchestrator = Orchestrator(
         store=store,
         ledger=ledger,
@@ -178,7 +203,10 @@ def make_orchestrator(
         planner=PlannerAgent(metered(planner_responses or [PLAN]), model="test-sonnet"),
         architect=ArchitectAgent(metered(architect_responses or [ARCH]), model="test-sonnet"),
         developer=DeveloperAgent(metered(dev_responses or [_dev_response(GOOD_CODE)]), model="test-sonnet"),
+        reviewer=ReviewerAgent(reviewer_llm, model="test-sonnet"),
+        security=SecurityAgent(metered(security_responses), model="test-sonnet"),
         qa=QAAgent(metered(qa_responses or [QA_RESPONSE]), model="test-sonnet"),
+        scan_suite=scan_suite or SecurityScanSuite([RegexSecretScanner()]),
         gate=gate or AutoApproveGate(),
         gate2=gate2,
         sandbox=LocalSandbox(),
@@ -212,10 +240,17 @@ def test_happy_path_end_to_end(tmp_path):
     depends_on_story = {a.artifact_id for a in store.find_by_trace("proj", "US-001")}
     assert {"proj:PRD", "proj:TCK-001", "proj:CODE-TCK-001"} <= depends_on_story
 
+    # a review artifact was recorded and the PR was merged
+    assert store.get("proj:REVIEW-TCK-001").content["verdict"] == "approve"
+    assert result.pr_pass_rate == 1.0
+    assert result.tickets[0].pr_number is not None
+    assert orchestrator.pr_publisher.prs[0].state == "merged"
+
     # code landed and cost is attributed per stage across the whole pipeline
+    # (security stage absent: clean code produced no findings, so no LLM call)
     assert (result.workspace / "greeter.py").exists()
     assert set(ledger.summary("proj")) == {
-        "intake", "scope", "estimate", "plan", "architecture", "build", "qa",
+        "intake", "scope", "estimate", "plan", "architecture", "build", "review", "qa",
     }
 
 
@@ -351,8 +386,8 @@ def test_invalid_planning_output_is_retried_with_defects(tmp_path):
     assert result.status == "completed"
     estimator_client = orchestrator.estimator.llm.client
     assert "total_points" in estimator_client.calls[1][1]
-    # wbs failed first try -> rate below 100%
-    assert result.first_try_validation_rate == pytest.approx(6 / 7)
+    # wbs failed first try -> rate below 100% (8 tracked artifacts incl. review)
+    assert result.first_try_validation_rate == pytest.approx(7 / 8)
 
 
 def test_budget_hard_stop(tmp_path):
@@ -370,24 +405,32 @@ def test_context_cap_escalates(tmp_path):
     assert "context cap exceeded" in result.escalations[0]
 
 
-def test_d3_same_llm_instance_for_dev_and_qa_is_refused(tmp_path):
+@pytest.mark.parametrize("shared_role", ["qa", "reviewer", "security"])
+def test_d3_shared_llm_with_developer_is_refused(tmp_path, shared_role):
     ledger = CostLedger()
     shared = MeteredLLM(MockLLM(handler=lambda s, p: "{}"), ledger)
+
+    def sep():
+        return MeteredLLM(MockLLM(handler=lambda s, p: "{}"), ledger)
+
+    kwargs = dict(
+        store=ArtifactStore(),
+        ledger=ledger,
+        analyst=AnalystAgent(sep(), model="m"),
+        product_owner=ProductOwnerAgent(sep(), model="m"),
+        estimator=EstimatorAgent(sep(), model="m"),
+        planner=PlannerAgent(sep(), model="m"),
+        architect=ArchitectAgent(sep(), model="m"),
+        developer=DeveloperAgent(shared, model="m"),
+        qa=QAAgent(shared if shared_role == "qa" else sep(), model="m"),
+        reviewer=ReviewerAgent(shared if shared_role == "reviewer" else sep(), model="m"),
+        security=SecurityAgent(shared if shared_role == "security" else sep(), model="m"),
+        gate=AutoApproveGate(),
+        sandbox=LocalSandbox(),
+        workspace_root=tmp_path,
+    )
     with pytest.raises(ValueError, match="D3"):
-        Orchestrator(
-            store=ArtifactStore(),
-            ledger=ledger,
-            analyst=AnalystAgent(shared, model="m"),
-            product_owner=ProductOwnerAgent(shared, model="m"),
-            estimator=EstimatorAgent(shared, model="m"),
-            planner=PlannerAgent(shared, model="m"),
-            architect=ArchitectAgent(shared, model="m"),
-            developer=DeveloperAgent(shared, model="m"),
-            qa=QAAgent(shared, model="m"),
-            gate=AutoApproveGate(),
-            sandbox=LocalSandbox(),
-            workspace_root=tmp_path,
-        )
+        Orchestrator(**kwargs)
 
 
 def test_invalid_analyst_output_counts_against_first_try_rate(tmp_path):
@@ -396,5 +439,5 @@ def test_invalid_analyst_output_counts_against_first_try_rate(tmp_path):
     )
     result = orchestrator.run_project("proj", "greeting library")
     assert result.status == "completed"
-    # prd failed first try; backlog/wbs/plan/arch/code/qa passed -> 6/7
-    assert result.first_try_validation_rate == pytest.approx(6 / 7)
+    # prd failed first try; backlog/wbs/plan/arch/code/review/qa passed -> 7/8
+    assert result.first_try_validation_rate == pytest.approx(7 / 8)

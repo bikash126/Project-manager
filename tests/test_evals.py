@@ -65,9 +65,43 @@ def test_prompt_fingerprint_tracks_playbook_changes():
     assert prompt_fingerprint(agent) != before
 
 
-def test_all_phase2_roles_have_golden_suites():
-    for role in ("product_owner", "estimator", "planner", "architect"):
+def test_all_agent_roles_have_golden_suites():
+    for role in ("product_owner", "estimator", "planner", "architect", "reviewer", "security"):
         assert cases_for(role), role
+
+
+def test_reviewer_suite_flags_rubber_stamp():
+    from pm_system.agents.reviewer import ReviewerAgent
+
+    # An agent that approves everything should fail the "blocks-insecure" case.
+    approve_all = json.dumps({"verdict": "approve", "comments": []})
+    agent = ReviewerAgent(
+        MeteredLLM(MockLLM(handler=lambda s, p: approve_all), CostLedger()), model="test-model"
+    )
+    report = EvalHarness(agent).run(cases_for("reviewer"))
+    assert not report.passed
+    blocks_case = next(r for r in report.results if r.case_id == "reviewer-blocks-insecure")
+    assert "blocks-hardcoded-secret" in blocks_case.defects
+
+
+def test_security_suite_flags_dismissed_secret():
+    from pm_system.agents.security import SecurityAgent
+
+    dismiss_all = json.dumps(
+        {
+            "triage": [
+                {"finding_id": "FND-001", "status": "false_positive", "reason": "meh"},
+                {"finding_id": "FND-002", "status": "false_positive", "reason": "style"},
+            ],
+            "threat_model_notes": "",
+        }
+    )
+    agent = SecurityAgent(
+        MeteredLLM(MockLLM(handler=lambda s, p: dismiss_all), CostLedger()), model="test-model"
+    )
+    report = EvalHarness(agent).run(cases_for("security"))
+    assert not report.passed
+    assert "confirms-the-secret" in report.results[0].defects
 
 
 def test_golden_wbs_is_internally_consistent():

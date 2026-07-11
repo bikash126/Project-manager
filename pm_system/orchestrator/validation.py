@@ -240,6 +240,38 @@ def validate_architecture(output: dict, mvp_story_ids: set[str]) -> list[str]:
     return defects
 
 
+def validate_security_triage(output: dict, finding_ids: set[str]) -> list[str]:
+    defects: list[str] = []
+    triaged = [entry["finding_id"] for entry in output.get("triage", [])]
+    unknown = sorted(set(triaged) - finding_ids)
+    if unknown:
+        defects.append(f"triage references unknown findings: {', '.join(unknown)}")
+    missing = sorted(finding_ids - set(triaged))
+    if missing:
+        defects.append(f"every finding must be triaged; missing: {', '.join(missing)}")
+    if len(triaged) != len(set(triaged)):
+        defects.append("a finding is triaged more than once")
+    for entry in output.get("triage", []):
+        if entry["status"] == "false_positive" and not entry["reason"].strip():
+            defects.append(
+                f"{entry['finding_id']}: a false_positive needs a written reason"
+            )
+    return defects
+
+
+def validate_review(output: dict) -> list[str]:
+    defects: list[str] = []
+    verdict = output.get("verdict")
+    severities = [c["severity"] for c in output.get("comments", [])]
+    has_blocker = "blocker" in severities
+    has_major = "major" in severities
+    if has_blocker and verdict != "block":
+        defects.append("a blocker-severity comment forces verdict=block")
+    if verdict == "block" and not (has_blocker or has_major):
+        defects.append("verdict=block requires at least one major or blocker comment")
+    return defects
+
+
 def is_safe_relative_path(path: str) -> bool:
     if not path or path.startswith(("/", "\\")) or "\\" in path:
         return False

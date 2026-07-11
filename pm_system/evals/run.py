@@ -15,6 +15,8 @@ from pm_system.agents.architect import ArchitectAgent
 from pm_system.agents.estimator import EstimatorAgent
 from pm_system.agents.planner import PlannerAgent
 from pm_system.agents.product_owner import ProductOwnerAgent
+from pm_system.agents.reviewer import ReviewerAgent
+from pm_system.agents.security import SecurityAgent
 from pm_system.config import MID_MODEL, STRONG_MODEL
 from pm_system.costs.ledger import CostLedger
 from pm_system.evals.golden import cases_for
@@ -26,6 +28,8 @@ AGENTS = {
     "estimator": (EstimatorAgent, MID_MODEL),
     "planner": (PlannerAgent, MID_MODEL),
     "architect": (ArchitectAgent, STRONG_MODEL),
+    "reviewer": (ReviewerAgent, STRONG_MODEL),
+    "security": (SecurityAgent, STRONG_MODEL),
 }
 
 

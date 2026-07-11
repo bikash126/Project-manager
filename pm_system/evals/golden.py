@@ -1,9 +1,10 @@
-"""Golden eval suites for the Phase 2 agents (Phase 2 exit criterion).
+"""Golden eval suites for the Phase 2 & 3 agents.
 
 One golden PRD (a small URL-shortener project) drives cases for the Product
-Owner, Estimator, Planner, and Architect. Checks reuse the orchestrator's
-handoff-verification functions plus per-role plausibility bounds, so the
-suites express "expected WBS/ADR shape" without brittle exact matching.
+Owner, Estimator, Planner, and Architect (Phase 2); Phase 3 adds Reviewer and
+Security cases. Checks reuse the orchestrator's handoff-verification functions
+plus per-role plausibility bounds, so the suites express "expected shape"
+without brittle exact matching.
 """
 
 from __future__ import annotations
@@ -13,6 +14,8 @@ from pm_system.evals.harness import EvalCase
 from pm_system.orchestrator.validation import (
     validate_architecture,
     validate_backlog,
+    validate_review,
+    validate_security_triage,
     validate_sprint_plan,
     validate_wbs,
 )
@@ -243,12 +246,101 @@ def architect_cases() -> list[EvalCase]:
     ]
 
 
+def reviewer_cases() -> list[EvalCase]:
+    insecure_diff = [
+        {
+            "path": "shortener/store.py",
+            "content": (
+                'API_KEY = "AKIAIOSFODNN7EXAMPLE1"\n\n'
+                "def save(code, url):\n"
+                "    # no validation of url\n"
+                "    DB[code] = url\n"
+            ),
+        }
+    ]
+    clean_diff = [
+        {
+            "path": "shortener/codes.py",
+            "content": (
+                "import secrets\n\n"
+                "def new_code(n: int = 7) -> str:\n"
+                '    return secrets.token_urlsafe(n)[:n]\n'
+            ),
+        }
+    ]
+    standards = "Never hardcode secrets. Validate external input."
+    return [
+        EvalCase(
+            case_id="reviewer-blocks-insecure",
+            context=ContextPackage(
+                instructions="Review this diff against the standards. Approve or block.",
+                artifacts={"diff": insecure_diff, "coding_standards": standards},
+            ),
+            checks=[
+                ("handoff", validate_review),
+                (
+                    "blocks-hardcoded-secret",
+                    lambda out: []
+                    if out["verdict"] == "block"
+                    else ["a diff with a hardcoded AWS key must be blocked"],
+                ),
+            ],
+        ),
+        EvalCase(
+            case_id="reviewer-approves-clean",
+            context=ContextPackage(
+                instructions="Review this diff against the standards. Approve or block.",
+                artifacts={"diff": clean_diff, "coding_standards": standards},
+            ),
+            checks=[
+                ("handoff", validate_review),
+                (
+                    "approves-clean-code",
+                    lambda out: []
+                    if out["verdict"] == "approve"
+                    else ["clean, standards-compliant code should be approved"],
+                ),
+            ],
+        ),
+    ]
+
+
+def security_cases() -> list[EvalCase]:
+    findings = (
+        "FND-001 [CRITICAL] regex-secrets:aws-access-key store.py:1 — hardcoded AWS key\n"
+        "FND-002 [LOW] semgrep:style tests/test_store.py:10 — assert on constant"
+    )
+    return [
+        EvalCase(
+            case_id="security-confirms-real-secret",
+            context=ContextPackage(
+                instructions="Triage these findings. Confirmed or false_positive per finding.",
+                artifacts={"findings": findings, "diff": []},
+            ),
+            checks=[
+                ("handoff", lambda out: validate_security_triage(out, {"FND-001", "FND-002"})),
+                (
+                    "confirms-the-secret",
+                    lambda out: []
+                    if any(
+                        t["finding_id"] == "FND-001" and t["status"] == "confirmed"
+                        for t in out["triage"]
+                    )
+                    else ["a real hardcoded AWS key must be confirmed, not dismissed"],
+                ),
+            ],
+        )
+    ]
+
+
 def cases_for(role: str) -> list[EvalCase]:
     suites = {
         "product_owner": product_owner_cases,
         "estimator": estimator_cases,
         "planner": planner_cases,
         "architect": architect_cases,
+        "reviewer": reviewer_cases,
+        "security": security_cases,
     }
     if role not in suites:
         raise KeyError(f"no golden suite for role {role!r}; have {sorted(suites)}")
