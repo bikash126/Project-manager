@@ -150,21 +150,27 @@ class MeteredLLM:
         return response
 
 
-_FENCED_JSON = re.compile(r"```(?:json)?\s*\n(.*?)```", re.DOTALL)
+_FENCE_OPEN = re.compile(r"```(?:json)?[ \t]*\n")
 
 
 def extract_json(text: str) -> dict:
     """Pull a single JSON object out of an LLM response.
 
-    Accepts a fenced ```json block or a bare object; raises ValueError otherwise.
+    Accepts a fenced ```json block or a bare object; raises ValueError
+    otherwise. When fenced, the content is taken up to the LAST closing fence
+    so that triple backticks inside the JSON (e.g. a README with a code block)
+    do not truncate it.
     """
-    match = _FENCED_JSON.search(text)
-    candidate = match.group(1) if match else None
-    if candidate is None:
-        start, end = text.find("{"), text.rfind("}")
-        if start == -1 or end <= start:
+    fence = _FENCE_OPEN.search(text)
+    if fence:
+        start = fence.end()
+        close = text.rfind("```")
+        candidate = text[start:close] if close > start else text[start:]
+    else:
+        first, last = text.find("{"), text.rfind("}")
+        if first == -1 or last <= first:
             raise ValueError("no JSON object found in response")
-        candidate = text[start : end + 1]
+        candidate = text[first : last + 1]
     data = json.loads(candidate)
     if not isinstance(data, dict):
         raise ValueError("response JSON is not an object")

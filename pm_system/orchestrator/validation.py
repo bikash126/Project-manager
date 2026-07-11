@@ -259,6 +259,41 @@ def validate_security_triage(output: dict, finding_ids: set[str]) -> list[str]:
     return defects
 
 
+def validate_data_engineering(output: dict) -> list[str]:
+    defects: list[str] = []
+    ids = [m["id"] for m in output.get("migrations", [])]
+    if len(ids) != len(set(ids)):
+        defects.append("duplicate migration ids")
+    return defects
+
+
+def validate_devops(output: dict) -> list[str]:
+    defects: list[str] = []
+    for group in ("pipeline_files", "iac_files"):
+        for file in output.get(group, []):
+            if not is_safe_relative_path(file["path"]):
+                defects.append(f"unsafe file path {file['path']!r} in {group}")
+    return defects
+
+
+def validate_release(output: dict) -> list[str]:
+    # semver + changelog shape are enforced by the JSON schema; nothing extra.
+    return []
+
+
+def validate_docs(output: dict) -> list[str]:
+    defects: list[str] = []
+    paths = [d["path"] for d in output.get("docs", [])]
+    for path in paths:
+        if not is_safe_relative_path(path):
+            defects.append(f"unsafe doc path {path!r}")
+    if not any("readme" in p.lower() for p in paths):
+        defects.append("docs must include a README")
+    if len(paths) != len(set(paths)):
+        defects.append("duplicate doc paths")
+    return defects
+
+
 def validate_review(output: dict) -> list[str]:
     defects: list[str] = []
     verdict = output.get("verdict")

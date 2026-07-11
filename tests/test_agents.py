@@ -28,6 +28,13 @@ def test_extract_json_variants():
         extract_json("[1, 2, 3]")
 
 
+def test_extract_json_tolerates_backticks_inside_content():
+    # A doc artifact whose content contains a Markdown code fence must not
+    # truncate the JSON at the inner ``` (fence captured to the last ```).
+    text = 'here\n```json\n{"docs": "use ```\\ncode\\n``` here"}\n```'
+    assert extract_json(text) == {"docs": "use ```\ncode\n``` here"}
+
+
 def test_agent_accepts_schema_valid_output():
     prd = _analyst([VALID_PRD]).run(ContextPackage(instructions="go"), TAGS)
     assert prd["user_stories"][0]["id"] == "US-001"

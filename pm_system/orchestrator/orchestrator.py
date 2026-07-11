@@ -1,26 +1,31 @@
 """PM Orchestrator — owns the project state machine (design doc §1, §3).
 
-Phase 3 state machine:
+Phase 4 state machine:
 
     intake (Analyst -> PRD, validated)
     -> scope (Product Owner -> backlog / MVP / cut list)
     -> estimate (Estimator -> WBS + risk register)
     -> plan (Planner -> sprint plan + dependency graph)
       -> [HUMAN GATE 1: scope + budget + plan]
-         rejection -> revision task to the Product Owner; estimate/plan re-run
-         approval  -> PRD, backlog, WBS, and plan flip draft -> approved
     -> architecture (Architect -> design doc, ADRs, contracts, data model)
       -> [HUMAN GATE 2: design]   (config.gate2_enabled)
     -> per-ticket loop (tickets from the sprint plan), bounded retry cap 3:
          Developer -> unit tests -> Security scan (blocking, pre-review)
                    -> Review (approve/block) -> QA (acceptance tests)
-         each block/failure -> targeted feedback to the Developer, retry
          cap reached -> escalate to human, PR closed, WIP left on the branch
-    -> done (status digest with cost + PR-pass-rate summary)
+    -> ship path (only if every ticket passed; config.enable_ship):
+         integration tests + license check
+         -> Data Engineer (migrations, if the design has a data model)
+         -> DevOps (CI/CD + IaC)
+         -> Release Manager (version, changelog, deploy + rollback plan)
+           -> [HUMAN GATE 3: release]  (config.gate3_enabled)
+           -> deploy (Release Manager only) -> Docs
+    -> done (digest: PR pass rate, security findings, human interventions,
+             shipped version, cost)
 
 Security runs before Review (exit criterion: findings caught pre-review) and
-its verdict is block/pass (D7): a confirmed finding at or above the blocking
-severity blocks, regardless of the agent's opinion. Each ticket is a PR.
+its verdict is block/pass (D7). Each ticket is a PR. A broken build (any
+escalated ticket) is never shipped.
 
 The orchestrator never writes code, designs, or docs itself; it curates
 context packages, validates outputs, enforces gates/retries/budgets/context
@@ -36,11 +41,15 @@ from typing import Callable
 from pm_system.agents.analyst import AnalystAgent
 from pm_system.agents.architect import ArchitectAgent
 from pm_system.agents.base import Agent, ContextPackage
+from pm_system.agents.data_engineer import DataEngineerAgent
 from pm_system.agents.developer import DeveloperAgent
+from pm_system.agents.devops import DevOpsAgent
+from pm_system.agents.doc_writer import DocWriterAgent
 from pm_system.agents.estimator import EstimatorAgent
 from pm_system.agents.planner import PlannerAgent
 from pm_system.agents.product_owner import ProductOwnerAgent
 from pm_system.agents.qa import QAAgent
+from pm_system.agents.release_manager import ReleaseManagerAgent
 from pm_system.agents.reviewer import ReviewerAgent
 from pm_system.agents.security import SecurityAgent
 from pm_system.artifacts.store import Artifact, ArtifactStatus, ArtifactStore
@@ -52,9 +61,10 @@ from pm_system.errors import (
     ContextOverflowError,
     EscalationError,
 )
-from pm_system.gates.gate import HumanGate
+from pm_system.gates.gate import GateDecision, HumanGate
 from pm_system.llm.client import CostTags
 from pm_system.notify.notifier import ConsoleNotifier, Notifier
+from pm_system.orchestrator.deploy import Deployer, NullDeployer
 from pm_system.orchestrator.git_workspace import GitWorkspace, NullGitWorkspace
 from pm_system.orchestrator.pr import NullPRPublisher, PRPublisher, Verdict
 from pm_system.orchestrator.validation import (
@@ -62,15 +72,20 @@ from pm_system.orchestrator.validation import (
     topological_order,
     validate_architecture,
     validate_backlog,
+    validate_data_engineering,
     validate_dev_output,
+    validate_devops,
+    validate_docs,
     validate_prd,
     validate_qa_output,
+    validate_release,
     validate_review,
     validate_security_triage,
     validate_sprint_plan,
     validate_wbs,
 )
 from pm_system.sandbox.runner import Sandbox, TestRunner
+from pm_system.security.licenses import LicenseChecker
 from pm_system.security.scanners import SecurityScanSuite, Severity
 
 STAGE_INTAKE = "intake"
@@ -84,6 +99,12 @@ STAGE_BUILD = "build"
 STAGE_SECURITY = "security"
 STAGE_REVIEW = "review"
 STAGE_QA = "qa"
+STAGE_INTEGRATION = "integration"
+STAGE_DATA = "data_engineering"
+STAGE_DEVOPS = "devops"
+STAGE_GATE3 = "gate3"
+STAGE_RELEASE = "release"
+STAGE_DOCS = "docs"
 STAGE_DONE = "done"
 
 
@@ -134,6 +155,11 @@ class ProjectResult:
     pr_pass_rate: float | None = None
     security_findings_total: int = 0
     security_blocks_total: int = 0
+    # Phase 4 ship path
+    shipped: bool = False
+    release_version: str | None = None
+    # Phase 4 metric: how many times a human had to engage (gates + escalations).
+    human_interventions: int = 0
 
 
 DEFAULT_STANDARDS_PATH = Path(__file__).resolve().parents[2] / "standards" / "coding_standards.md"
@@ -157,9 +183,16 @@ class Orchestrator:
         workspace_root: Path,
         reviewer: ReviewerAgent | None = None,
         security: SecurityAgent | None = None,
+        data_engineer: DataEngineerAgent | None = None,
+        devops: DevOpsAgent | None = None,
+        release_manager: ReleaseManagerAgent | None = None,
+        doc_writer: DocWriterAgent | None = None,
         scan_suite: SecurityScanSuite | None = None,
+        license_checker: LicenseChecker | None = None,
         pr_publisher: PRPublisher | None = None,
+        deployer: Deployer | None = None,
         gate2: HumanGate | None = None,
+        gate3: HumanGate | None = None,
         notifier: Notifier | None = None,
         config: OrchestratorConfig | None = None,
         test_python: str = "python",
@@ -180,6 +213,20 @@ class Orchestrator:
             raise ValueError("enable_review is set but no reviewer agent was provided")
         if self.config.enable_security and security is None:
             raise ValueError("enable_security is set but no security agent was provided")
+        if self.config.enable_ship:
+            missing = [
+                name
+                for name, agent in (
+                    ("devops", devops),
+                    ("release_manager", release_manager),
+                    ("doc_writer", doc_writer),
+                )
+                if agent is None
+            ]
+            if missing:
+                raise ValueError(
+                    f"enable_ship is set but these agents were not provided: {', '.join(missing)}"
+                )
 
         self.store = store
         self.ledger = ledger
@@ -192,10 +239,17 @@ class Orchestrator:
         self.qa = qa
         self.reviewer = reviewer
         self.security = security
+        self.data_engineer = data_engineer
+        self.devops = devops
+        self.release_manager = release_manager
+        self.doc_writer = doc_writer
         self.scan_suite = scan_suite or SecurityScanSuite()
+        self.license_checker = license_checker or LicenseChecker()
         self.pr_publisher = pr_publisher or NullPRPublisher()
+        self.deployer = deployer or NullDeployer()
         self.gate = gate
         self.gate2 = gate2 or gate
+        self.gate3 = gate3 or gate
         self.workspace_root = Path(workspace_root)
         self.notifier = notifier or ConsoleNotifier()
         self.test_runner = TestRunner(
@@ -206,35 +260,24 @@ class Orchestrator:
         self.standards = path.read_text() if path.exists() else ""
         self.tracker = ValidationTracker()
         self._versions: dict[str, int] = {}
+        self._interventions = 0
 
     # ------------------------------------------------------------------ api
 
     def run_project(self, project_id: str, raw_idea: str, constraints: str = "") -> ProjectResult:
         result = ProjectResult(project_id=project_id, status="completed")
         self._versions = {}
+        self._interventions = 0
         try:
             prd = self._stage_prd(project_id, raw_idea)
             result.prd_artifact_id = f"{project_id}:PRD"
             planning = self._planning_with_gate1(project_id, prd, constraints)
             architecture = self._architecture_with_gate2(project_id, prd, planning, constraints)
-        except EscalationError as exc:
-            result.status = "escalated"
-            result.escalations.append(str(exc))
-            return self._finish(result)
-        except ContextOverflowError as exc:
-            result.status = "escalated"
-            result.escalations.append(f"context cap exceeded: {exc}")
-            return self._finish(result)
-        except BudgetExceededError as exc:
-            result.status = "budget_exceeded"
-            result.escalations.append(str(exc))
-            return self._finish(result)
 
-        tickets = self._derive_tickets(project_id, prd, planning, architecture)
-        workspace = self._init_workspace(project_id)
-        result.workspace = workspace.root
+            tickets = self._derive_tickets(project_id, prd, planning, architecture)
+            workspace = self._init_workspace(project_id)
+            result.workspace = workspace.root
 
-        try:
             for ticket in tickets:
                 ticket_result = self._run_ticket(project_id, workspace, ticket)
                 result.tickets.append(ticket_result)
@@ -243,14 +286,27 @@ class Orchestrator:
                         f"{ticket_result.ticket_id} escalated after "
                         f"{ticket_result.attempts} attempts: {ticket_result.detail[:500]}"
                     )
+
+            if any(t.status == "escalated" for t in result.tickets):
+                # A broken build is not shippable — skip the ship path.
+                result.status = "escalated"
+            elif self.config.enable_ship:
+                self._ship(project_id, prd, architecture, workspace, result)
+        except EscalationError as exc:
+            result.status = "escalated"
+            result.escalations.append(str(exc))
+        except ContextOverflowError as exc:
+            result.status = "escalated"
+            result.escalations.append(f"context cap exceeded: {exc}")
         except BudgetExceededError as exc:
             result.status = "budget_exceeded"
             result.escalations.append(str(exc))
-            return self._finish(result)
-
-        if any(t.status == "escalated" for t in result.tickets):
-            result.status = "escalated"
         return self._finish(result)
+
+    def _request_gate(self, gate: HumanGate, name: str, digest: str) -> GateDecision:
+        """Every gate interaction is a human intervention (metric, design §9)."""
+        self._interventions += 1
+        return gate.request_approval(name, digest)
 
     # ---------------------------------------------------------- generic step
 
@@ -392,7 +448,8 @@ class Orchestrator:
             )
 
             self._notify(project_id, STAGE_GATE1, "requesting human approval (scope + budget + plan)")
-            decision = self.gate.request_approval(
+            decision = self._request_gate(
+                self.gate,
                 "Gate 1 — scope, budget & plan",
                 self._gate1_digest(project_id, prd, backlog, wbs, plan),
             )
@@ -450,7 +507,8 @@ class Orchestrator:
                 return architecture
 
             self._notify(project_id, STAGE_GATE2, "requesting human approval (architecture)")
-            decision = self.gate2.request_approval(
+            decision = self._request_gate(
+                self.gate2,
                 "Gate 2 — architecture & design",
                 self._gate2_digest(project_id, architecture),
             )
@@ -693,6 +751,192 @@ class Orchestrator:
 
         return self._escalate_ticket(project_id, workspace, pr, result, last_failure)
 
+    # ---------------------------------------------------------- ship path
+
+    def _ship(self, project_id, prd, architecture, workspace, result: ProjectResult) -> None:
+        """Integration -> data migrations -> DevOps -> Gate 3 -> release -> docs.
+
+        Only reached when every ticket passed. Raises EscalationError if a ship
+        step cannot be satisfied (caught by run_project).
+        """
+        # --- Integration QA + contract tests + license check
+        self._notify(project_id, STAGE_INTEGRATION, "running integration tests + license check")
+        integration = self.test_runner.run(workspace.root)
+        if not integration.passed:
+            raise EscalationError(
+                f"integration tests failed after all tickets merged:\n{integration.summary[-1000:]}"
+            )
+        license_report = self.license_checker.check(workspace.root)
+        if not license_report.clean:
+            raise EscalationError(
+                "license check blocked the release:\n" + license_report.render()
+            )
+        self._record(project_id, f"{project_id}:INTEGRATION", "integration", {
+            "tests": "passed",
+            "license_findings": [f.package for f in license_report.findings],
+        }, created_by="orchestrator", trace_ids=[])
+
+        # --- Data Engineer (only if the architecture defines a data model)
+        if self.data_engineer is not None and architecture.get("data_model"):
+            migrations = self._produce(
+                project_id=project_id,
+                kind="migrations",
+                stage=STAGE_DATA,
+                agent=self.data_engineer,
+                artifact_id=f"{project_id}:MIGRATIONS",
+                artifact_type="migrations",
+                instructions=(
+                    "Produce reversible migrations (up/down) for the data model below, "
+                    "plus optional seed data, and declare backward compatibility."
+                ),
+                artifacts={"data_model": architecture["data_model"]},
+                validate=validate_data_engineering,
+                trace_ids=lambda out: [m["id"] for m in out["migrations"]],
+            )
+            for migration in migrations["migrations"]:
+                safe_write(
+                    workspace.root,
+                    f"migrations/{migration['id']}.sql",
+                    f"-- {migration['description']}\n-- up\n{migration['up']}\n"
+                    f"-- down\n{migration['down']}\n",
+                )
+            self.store.set_status(f"{project_id}:MIGRATIONS", ArtifactStatus.APPROVED)
+
+        # --- DevOps: CI/CD + IaC
+        devops = self._produce(
+            project_id=project_id,
+            kind="devops",
+            stage=STAGE_DEVOPS,
+            agent=self.devops,
+            artifact_id=f"{project_id}:DEVOPS",
+            artifact_type="devops",
+            instructions=(
+                "Produce the CI/CD pipeline and any IaC for this project, plus the "
+                "environment list. Pipeline must at least install deps and run the tests."
+            ),
+            artifacts={"architecture_overview": architecture["overview"],
+                       "components": architecture["components"]},
+            validate=validate_devops,
+            trace_ids=lambda out: [],
+        )
+        for file in devops.get("pipeline_files", []) + devops.get("iac_files", []):
+            safe_write(workspace.root, file["path"], file["content"])
+        self.store.set_status(f"{project_id}:DEVOPS", ArtifactStatus.APPROVED)
+
+        # --- Release Manager: version, changelog, deploy + rollback plan
+        story_summary = [{"id": s["id"], "story": s["story"]} for s in prd["user_stories"]]
+        release = self._release_with_gate3(project_id, prd, story_summary, result)
+
+        # --- Docs
+        docs = self._produce(
+            project_id=project_id,
+            kind="docs",
+            stage=STAGE_DOCS,
+            agent=self.doc_writer,
+            artifact_id=f"{project_id}:DOCS",
+            artifact_type="docs",
+            instructions=(
+                "Write user-facing docs for the shipped project: a README plus any "
+                "API/usage docs. Base them on the PRD and the shipped code."
+            ),
+            artifacts={
+                "prd": {"title": prd["title"], "summary": prd["summary"], "user_stories": story_summary},
+                "code_files": self._list_workspace(workspace.root),
+                "version": release["version"],
+            },
+            validate=validate_docs,
+            trace_ids=lambda out: [],
+        )
+        for doc in docs["docs"]:
+            safe_write(workspace.root, doc["path"], doc["content"])
+        self.store.set_status(f"{project_id}:DOCS", ArtifactStatus.APPROVED)
+
+        if isinstance(workspace, GitWorkspace):
+            workspace.commit_all(f"ship: release {release['version']}")
+        result.shipped = True
+        result.release_version = release["version"]
+        self._notify(project_id, STAGE_DONE, f"shipped {release['version']}")
+
+    def _release_with_gate3(self, project_id, prd, story_summary, result) -> dict:
+        artifact_id = f"{project_id}:RELEASE"
+        gate_feedback: str | None = None
+        for round_number in range(1, self.config.max_retries + 1):
+            release = self._produce(
+                project_id=project_id,
+                kind="release",
+                stage=STAGE_RELEASE,
+                agent=self.release_manager,
+                artifact_id=artifact_id,
+                artifact_type="release",
+                instructions=(
+                    "Produce the release: a semver version (this is the first release), "
+                    "a changelog, a deploy plan, and a rollback plan."
+                ),
+                artifacts={"project": prd["title"], "stories": story_summary},
+                validate=validate_release,
+                trace_ids=lambda out: [],
+                feedback=gate_feedback,
+            )
+            if not self.config.gate3_enabled:
+                break
+            self._notify(project_id, STAGE_GATE3, "requesting human approval (release)")
+            decision = self._request_gate(
+                self.gate3, "Gate 3 — release", self._gate3_digest(project_id, release)
+            )
+            if decision.approved:
+                break
+            gate_feedback = f"Human gate rejected the release (round {round_number}): {decision.comments}"
+            self._notify(project_id, STAGE_GATE3, f"release rejected: {decision.comments}")
+        else:
+            raise EscalationError(
+                f"release for {project_id} not approved within {self.config.max_retries} gate rounds"
+            )
+
+        self.store.set_status(artifact_id, ArtifactStatus.APPROVED)
+        # Only the Release Manager triggers a deploy (credential scoping).
+        deployment = self.deployer.deploy(
+            project_id=project_id,
+            version=release["version"],
+            environment=self.config.deploy_environment,
+            plan=release["deploy_plan"],
+        )
+        self._last_deployment = deployment
+        safe_write(
+            self.workspace_root / project_id,
+            "CHANGELOG.md",
+            self._render_changelog(release),
+        )
+        self._notify(project_id, STAGE_RELEASE, f"deployed {release['version']}")
+        return release
+
+    @staticmethod
+    def _render_changelog(release: dict) -> str:
+        lines = [f"# Changelog\n\n## {release['version']}\n"]
+        for entry in release["changelog"]:
+            lines.append(f"- **{entry['type']}**: {entry['description']}")
+        return "\n".join(lines) + "\n"
+
+    def _gate3_digest(self, project_id, release) -> str:
+        changes = "\n".join(f"  - {e['type']}: {e['description']}" for e in release["changelog"])
+        return (
+            f"Project {project_id} — release {release['version']}\n"
+            f"Changelog:\n{changes}\n"
+            f"Deploy plan: {release['deploy_plan']}\n"
+            f"Rollback plan: {release['rollback_plan']}\n"
+            f"Spend so far: ${self.ledger.project_spend(project_id):.4f}"
+        )
+
+    def _record(self, project_id, artifact_id, artifact_type, content, *, created_by, trace_ids):
+        self.store.put(
+            artifact_id,
+            artifact_type=artifact_type,
+            content=content,
+            created_by=created_by,
+            project_id=project_id,
+            trace_ids=trace_ids,
+        )
+        self.store.set_status(artifact_id, ArtifactStatus.APPROVED)
+
     def _security_step(self, project_id, ticket, workspace, diff, pr):
         """Run scanners, triage findings, return (blocked, report, n_findings).
 
@@ -794,6 +1038,7 @@ class Orchestrator:
         self.pr_publisher.close_pr(pr, f"escalated after {result.attempts} attempt(s)")
         result.status = "escalated"
         result.detail = detail
+        self._interventions += 1  # a human now owns this ticket
         self._notify(
             project_id,
             STAGE_BUILD,
@@ -919,6 +1164,7 @@ class Orchestrator:
         result.total_cost_usd = self.ledger.project_spend(result.project_id)
         result.security_findings_total = sum(t.security_findings for t in result.tickets)
         result.security_blocks_total = sum(t.security_blocks for t in result.tickets)
+        result.human_interventions = self._interventions
         if result.tickets:
             passed = sum(1 for t in result.tickets if t.status == "passed")
             result.pr_pass_rate = passed / len(result.tickets)
@@ -928,13 +1174,15 @@ class Orchestrator:
             else f"{result.first_try_validation_rate:.0%}"
         )
         pr_rate = "n/a" if result.pr_pass_rate is None else f"{result.pr_pass_rate:.0%}"
+        shipped = f"shipped {result.release_version}" if result.shipped else "not shipped"
         self._notify(
             result.project_id,
             STAGE_DONE,
-            f"project {result.status}; {len(result.tickets)} tickets; "
+            f"project {result.status}; {shipped}; {len(result.tickets)} tickets; "
             f"PR pass rate (Review+QA within {self.config.max_retries}) {pr_rate}; "
             f"security findings {result.security_findings_total} "
             f"({result.security_blocks_total} blocking); "
+            f"human interventions {result.human_interventions}; "
             f"first-try validation rate {rate}; "
             f"total cost ${result.total_cost_usd:.4f}; "
             f"per stage: {self.ledger.summary(result.project_id)}",

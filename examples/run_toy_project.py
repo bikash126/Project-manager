@@ -22,10 +22,13 @@ from examples.toy_responses import (
     DEV_TICKET_1_INSECURE,
     DEV_TICKET_2,
     DEVELOPER_RESPONSES,
+    DEVOPS_RESPONSES,
+    DOCS_RESPONSES,
     ESTIMATOR_RESPONSES,
     PLANNER_RESPONSES,
     PRODUCT_OWNER_RESPONSES,
     QA_RESPONSES,
+    RELEASE_RESPONSES,
     REVIEWER_RESPONSES,
     SECURITY_CONFIRM,
 )
@@ -37,7 +40,10 @@ from pm_system import (
     ConsoleGate,
     ConsoleNotifier,
     CostLedger,
+    DataEngineerAgent,
     DeveloperAgent,
+    DevOpsAgent,
+    DocWriterAgent,
     EstimatorAgent,
     MeteredLLM,
     MockLLM,
@@ -46,10 +52,11 @@ from pm_system import (
     PlannerAgent,
     ProductOwnerAgent,
     QAAgent,
+    ReleaseManagerAgent,
     ReviewerAgent,
     SecurityAgent,
 )
-from pm_system.config import MID_MODEL, STRONG_MODEL
+from pm_system.config import CHEAP_MODEL, MID_MODEL, STRONG_MODEL
 from pm_system.sandbox.runner import DockerSandbox, LocalSandbox, default_sandbox
 
 
@@ -78,7 +85,7 @@ def main(argv=None) -> int:
         stage_budgets={
             "intake": 5.0, "scope": 5.0, "estimate": 5.0, "plan": 5.0,
             "architecture": 10.0, "build": 20.0, "security": 10.0,
-            "review": 10.0, "qa": 10.0,
+            "review": 10.0, "qa": 10.0, "devops": 5.0, "release": 5.0, "docs": 5.0,
         }
     )
 
@@ -103,6 +110,10 @@ def main(argv=None) -> int:
     reviewer = ReviewerAgent(metered(REVIEWER_RESPONSES), model=STRONG_MODEL)
     security = SecurityAgent(metered(security_responses), model=STRONG_MODEL)
     qa = QAAgent(metered(QA_RESPONSES), model=STRONG_MODEL)
+    data_engineer = DataEngineerAgent(metered([]), model=MID_MODEL)  # no data model in toy
+    devops = DevOpsAgent(metered(DEVOPS_RESPONSES), model=MID_MODEL)
+    release_manager = ReleaseManagerAgent(metered(RELEASE_RESPONSES), model=CHEAP_MODEL)
+    doc_writer = DocWriterAgent(metered(DOCS_RESPONSES), model=CHEAP_MODEL)
 
     if args.sandbox == "local":
         sandbox = LocalSandbox()
@@ -126,6 +137,10 @@ def main(argv=None) -> int:
         reviewer=reviewer,
         security=security,
         qa=qa,
+        data_engineer=data_engineer,
+        devops=devops,
+        release_manager=release_manager,
+        doc_writer=doc_writer,
         gate=ConsoleGate() if args.gate == "console" else AutoApproveGate(),
         sandbox=sandbox,
         workspace_root=workspace_root,
@@ -150,6 +165,8 @@ def main(argv=None) -> int:
     print(f"first-try validation rate: {'n/a' if rate is None else f'{rate:.0%}'} (P1/P2 exit: >= 80%)")
     print(f"PR pass rate (Review+QA within 3): {'n/a' if pr_rate is None else f'{pr_rate:.0%}'} (P3 exit: >= 70%)")
     print(f"security findings: {result.security_findings_total} ({result.security_blocks_total} blocking)")
+    print(f"shipped: {result.shipped} (version {result.release_version})  [P4 exit: shipped end-to-end]")
+    print(f"human interventions: {result.human_interventions}")
     print(f"total cost: ${result.total_cost_usd:.4f}")
     print(f"workspace: {result.workspace}")
 

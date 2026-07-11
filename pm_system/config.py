@@ -30,3 +30,7 @@ class OrchestratorConfig:
     enable_security: bool = True  # run the security scan step (Dev -> Security -> Review -> QA)
     enable_review: bool = True  # run the Reviewer step
     blocking_severity: str = "high"  # confirmed findings >= this block the PR (D7)
+    # Phase 4 ship path
+    enable_ship: bool = True  # run the ship path after the build loop
+    gate3_enabled: bool = True  # human gate on release (D4)
+    deploy_environment: str = "production"

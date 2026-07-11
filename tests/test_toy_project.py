@@ -11,9 +11,14 @@ def test_toy_project_end_to_end(tmp_path, capsys):
     assert "TCK-002 (US-002): passed" in out
     assert "first-try validation rate: 100%" in out
     assert "PR pass rate (Review+QA within 3): 100%" in out
+    assert "shipped: True (version 0.1.0)" in out
     # both tickets' code really landed
     assert (tmp_path / "toy-temp-converter" / "temp_converter" / "cli.py").exists()
     assert (tmp_path / "toy-temp-converter" / "tests" / "qa" / "test_tck002_acceptance.py").exists()
+    # ship path produced CI, changelog, and docs
+    assert (tmp_path / "toy-temp-converter" / ".github" / "workflows" / "ci.yml").exists()
+    assert (tmp_path / "toy-temp-converter" / "CHANGELOG.md").exists()
+    assert (tmp_path / "toy-temp-converter" / "README.md").exists()
 
 
 def test_toy_project_security_gate_catches_planted_secret(tmp_path, capsys):

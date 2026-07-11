@@ -379,6 +379,60 @@ def _review_approve(ticket_id: str) -> str:
 REVIEW_TICKET_1 = _review_approve("TCK-001")
 REVIEW_TICKET_2 = _review_approve("TCK-002")
 
+DEVOPS = _fenced(
+    {
+        "pipeline_files": [
+            {
+                "path": ".github/workflows/ci.yml",
+                "content": (
+                    "name: ci\n"
+                    "on: [push, pull_request]\n"
+                    "jobs:\n"
+                    "  test:\n"
+                    "    runs-on: ubuntu-latest\n"
+                    "    steps:\n"
+                    "      - uses: actions/checkout@v4\n"
+                    "      - uses: actions/setup-python@v5\n"
+                    "        with: {python-version: '3.12'}\n"
+                    "      - run: pip install pytest\n"
+                    "      - run: python -m pytest\n"
+                ),
+            }
+        ],
+        "iac_files": [],
+        "environments": ["staging", "production"],
+    }
+)
+
+RELEASE = _fenced(
+    {
+        "version": "0.1.0",
+        "changelog": [
+            {"type": "added", "description": "Celsius/Fahrenheit conversion"},
+            {"type": "added", "description": "input validation with clear errors"},
+        ],
+        "deploy_plan": "Tag 0.1.0, publish to PyPI, promote staging -> production.",
+        "rollback_plan": "yank 0.1.0 from PyPI and re-pin the previous tag; no data migrations to revert.",
+    }
+)
+
+DOCS = _fenced(
+    {
+        "docs": [
+            {
+                "path": "README.md",
+                "content": (
+                    "# Temperature Converter CLI\n\n"
+                    "Convert temperatures between Celsius and Fahrenheit.\n\n"
+                    "## Usage\n\n"
+                    "```\ntemp-converter 100 c   # -> 212 F\n"
+                    "temp-converter 32 f    # -> 0 C\n```\n"
+                ),
+            }
+        ]
+    }
+)
+
 ANALYST_RESPONSES = [PRD]
 PRODUCT_OWNER_RESPONSES = [BACKLOG]
 ESTIMATOR_RESPONSES = [WBS]
@@ -389,3 +443,7 @@ REVIEWER_RESPONSES = [REVIEW_TICKET_1, REVIEW_TICKET_2]
 # Security agent is only invoked when scanners find something; the toy code is
 # clean, so no scripted security responses are needed.
 QA_RESPONSES = [QA_TICKET_1, QA_TICKET_2]
+# Ship path (toy data model is empty, so the Data Engineer is not invoked).
+DEVOPS_RESPONSES = [DEVOPS]
+RELEASE_RESPONSES = [RELEASE]
+DOCS_RESPONSES = [DOCS]

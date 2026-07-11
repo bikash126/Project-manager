@@ -9,9 +9,13 @@ from pm_system.agents.analyst import AnalystAgent
 from pm_system.agents.architect import ArchitectAgent
 from pm_system.agents.developer import DeveloperAgent
 from pm_system.agents.estimator import EstimatorAgent
+from pm_system.agents.data_engineer import DataEngineerAgent
+from pm_system.agents.devops import DevOpsAgent
+from pm_system.agents.doc_writer import DocWriterAgent
 from pm_system.agents.planner import PlannerAgent
 from pm_system.agents.product_owner import ProductOwnerAgent
 from pm_system.agents.qa import QAAgent
+from pm_system.agents.release_manager import ReleaseManagerAgent
 from pm_system.agents.reviewer import ReviewerAgent
 from pm_system.agents.security import SecurityAgent
 from pm_system.artifacts.store import ArtifactStatus, ArtifactStore
@@ -152,6 +156,36 @@ REVIEW_BLOCK = json.dumps(
     }
 )
 
+DEVOPS_R = json.dumps(
+    {
+        "pipeline_files": [
+            {"path": ".github/workflows/ci.yml", "content": "name: ci\non: [push]\n"}
+        ],
+        "iac_files": [],
+        "environments": ["staging", "production"],
+    }
+)
+RELEASE_R = json.dumps(
+    {
+        "version": "0.1.0",
+        "changelog": [{"type": "added", "description": "greeter"}],
+        "deploy_plan": "tag and publish",
+        "rollback_plan": "revert the tag; no migrations",
+    }
+)
+DOCS_R = json.dumps(
+    {"docs": [{"path": "README.md", "content": "# Greeter\n\nGreets people.\n"}]}
+)
+DATA_R = json.dumps(
+    {
+        "migrations": [
+            {"id": "MIG-001", "description": "create greetings", "up": "CREATE TABLE g(id int);",
+             "down": "DROP TABLE g;"}
+        ],
+        "backward_compatible": True,
+    }
+)
+
 
 class ScriptedGate(HumanGate):
     def __init__(self, decisions):
@@ -175,9 +209,14 @@ def make_orchestrator(
     reviewer_responses=None,
     security_responses=None,
     qa_responses=None,
+    devops_responses=None,
+    release_responses=None,
+    docs_responses=None,
+    data_responses=None,
     scan_suite=None,
     gate=None,
     gate2=None,
+    gate3=None,
     ledger=None,
     config=None,
 ):
@@ -206,13 +245,20 @@ def make_orchestrator(
         reviewer=ReviewerAgent(reviewer_llm, model="test-sonnet"),
         security=SecurityAgent(metered(security_responses), model="test-sonnet"),
         qa=QAAgent(metered(qa_responses or [QA_RESPONSE]), model="test-sonnet"),
+        data_engineer=DataEngineerAgent(metered(data_responses), model="test-sonnet"),
+        devops=DevOpsAgent(metered(devops_responses or [DEVOPS_R]), model="test-sonnet"),
+        release_manager=ReleaseManagerAgent(metered(release_responses or [RELEASE_R]), model="test-sonnet"),
+        doc_writer=DocWriterAgent(metered(docs_responses or [DOCS_R]), model="test-sonnet"),
         scan_suite=scan_suite or SecurityScanSuite([RegexSecretScanner()]),
         gate=gate or AutoApproveGate(),
         gate2=gate2,
+        gate3=gate3,
         sandbox=LocalSandbox(),
         workspace_root=tmp_path / "workspaces",
         notifier=NullNotifier(),
-        config=config or OrchestratorConfig(sandbox_timeout=120),
+        # Ship path off by default so Phase 1-3 gate tests keep their exact gate
+        # counts; Phase 4 tests opt in with enable_ship=True.
+        config=config or OrchestratorConfig(sandbox_timeout=120, enable_ship=False),
         test_python=sys.executable,
     )
     return orchestrator, store, ledger
@@ -355,7 +401,7 @@ def test_gate2_can_be_disabled(tmp_path):
     orchestrator, store, _ = make_orchestrator(
         tmp_path,
         gate=gate,
-        config=OrchestratorConfig(sandbox_timeout=120, gate2_enabled=False),
+        config=OrchestratorConfig(sandbox_timeout=120, gate2_enabled=False, enable_ship=False),
     )
     result = orchestrator.run_project("proj", "greeting library")
     assert result.status == "completed"
