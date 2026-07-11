@@ -1,0 +1,24 @@
+[project]
+name = "pm-system"
+version = "0.1.0"
+description = "Multi-agent software development PM system — Phase 1 skeleton (Orchestrator + Analyst/Developer/QA)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "jsonschema>=4.17",
+]
+
+[project.optional-dependencies]
+llm = ["anthropic>=0.40"]
+slack = ["slack_sdk>=3.27"]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["pm_system*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
