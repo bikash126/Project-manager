@@ -48,35 +48,124 @@ class Sandbox(ABC):
         ...
 
 
+@dataclass(frozen=True)
+class EgressPolicy:
+    """Network egress policy for sandboxed tasks (design doc §4).
+
+    - "none": no network at all (default).
+    - "full": unrestricted bridge networking — dev/debug only.
+    - "allowlist": task containers run on an internal Docker network whose
+      only way out is a sidecar proxy that enforces `allowed_hosts`
+      (see egress_proxy.py). Direct egress is impossible because internal
+      networks have no external route.
+    """
+
+    mode: str = "none"  # none | full | allowlist
+    allowed_hosts: tuple[str, ...] = ()
+
+    @classmethod
+    def none(cls) -> "EgressPolicy":
+        return cls(mode="none")
+
+    @classmethod
+    def full(cls) -> "EgressPolicy":
+        return cls(mode="full")
+
+    @classmethod
+    def allowlist(cls, hosts: list[str] | tuple[str, ...]) -> "EgressPolicy":
+        if not hosts:
+            raise ValueError("allowlist mode needs at least one host; use EgressPolicy.none()")
+        return cls(mode="allowlist", allowed_hosts=tuple(hosts))
+
+
+INTERNAL_NETWORK = "pm-sandbox-internal"
+PROXY_PORT = 8888
+_PROXY_SCRIPT = Path(__file__).resolve().parent / "egress_proxy.py"
+
+
 class DockerSandbox(Sandbox):
     def __init__(
         self,
         image: str = "pm-sandbox:latest",
         *,
-        network: str = "none",
+        egress: EgressPolicy | None = None,
         memory: str = "1g",
         cpus: float = 1.0,
     ):
         self.image = image
-        self.network = network
+        self.egress = egress or EgressPolicy.none()
         self.memory = memory
         self.cpus = cpus
 
-    def run(self, command, *, workdir, timeout=300, env=None) -> SandboxResult:
-        name = f"pm-sandbox-{uuid.uuid4().hex[:12]}"
+    def _proxy_name(self) -> str:
+        digest = uuid.uuid5(uuid.NAMESPACE_URL, ",".join(self.egress.allowed_hosts)).hex[:8]
+        return f"pm-egress-proxy-{digest}"
+
+    def _run_args(self, command: list[str], workdir: Path, env: dict[str, str], name: str) -> list[str]:
         docker_cmd = [
             "docker", "run", "--rm",
             "--name", name,
-            "--network", self.network,
             "--memory", self.memory,
             f"--cpus={self.cpus}",
             "-v", f"{Path(workdir).resolve()}:/workspace",
             "-w", "/workspace",
         ]
-        for key, value in (env or {}).items():
+        merged_env = dict(env)
+        if self.egress.mode == "none":
+            docker_cmd += ["--network", "none"]
+        elif self.egress.mode == "full":
+            docker_cmd += ["--network", "bridge"]
+        else:
+            proxy_url = f"http://{self._proxy_name()}:{PROXY_PORT}"
+            docker_cmd += ["--network", INTERNAL_NETWORK]
+            merged_env.update(
+                HTTP_PROXY=proxy_url, HTTPS_PROXY=proxy_url,
+                http_proxy=proxy_url, https_proxy=proxy_url,
+            )
+        for key, value in merged_env.items():
             docker_cmd += ["-e", f"{key}={value}"]
         docker_cmd.append(self.image)
         docker_cmd += command
+        return docker_cmd
+
+    def _ensure_allowlist_infra(self) -> None:
+        """Create the internal network and the allowlisting proxy sidecar."""
+        inspect = subprocess.run(
+            ["docker", "network", "inspect", INTERNAL_NETWORK], capture_output=True
+        )
+        if inspect.returncode != 0:
+            subprocess.run(
+                ["docker", "network", "create", "--internal", INTERNAL_NETWORK],
+                capture_output=True, check=True,
+            )
+        proxy = self._proxy_name()
+        running = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Running}}", proxy], capture_output=True, text=True
+        )
+        if running.returncode == 0 and running.stdout.strip() == "true":
+            return
+        subprocess.run(["docker", "rm", "-f", proxy], capture_output=True)
+        subprocess.run(
+            [
+                "docker", "run", "-d", "--name", proxy,
+                "--network", INTERNAL_NETWORK,
+                "-v", f"{_PROXY_SCRIPT}:/egress_proxy.py:ro",
+                "-e", f"ALLOWED_HOSTS={','.join(self.egress.allowed_hosts)}",
+                "python:3.12-slim", "python", "/egress_proxy.py",
+            ],
+            capture_output=True, check=True,
+        )
+        # Second leg: the bridge network gives the proxy (and only the proxy)
+        # a route out of the internal network.
+        subprocess.run(
+            ["docker", "network", "connect", "bridge", proxy], capture_output=True, check=True
+        )
+
+    def run(self, command, *, workdir, timeout=300, env=None) -> SandboxResult:
+        if self.egress.mode == "allowlist":
+            self._ensure_allowlist_infra()
+        name = f"pm-sandbox-{uuid.uuid4().hex[:12]}"
+        docker_cmd = self._run_args(command, Path(workdir), env or {}, name)
 
         start = time.monotonic()
         try:

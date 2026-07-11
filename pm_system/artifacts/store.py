@@ -208,6 +208,14 @@ class ArtifactStore:
         rows = self._conn.execute(query, params).fetchall()
         return sorted((self._to_artifact(r) for r in rows), key=lambda a: a.artifact_id)
 
+    def find_by_trace(self, project_id: str, trace_id: str) -> list[Artifact]:
+        """Traceability index: what depends on US-014? (design doc §4)."""
+        return [
+            artifact
+            for artifact in self.list_project(project_id)
+            if trace_id in artifact.trace_ids
+        ]
+
     def _latest_row(self, artifact_id: str):
         return self._conn.execute(
             "SELECT * FROM artifacts WHERE artifact_id = ? ORDER BY version DESC LIMIT 1",

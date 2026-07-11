@@ -68,6 +68,178 @@ def validate_qa_output(output: dict, ticket_id: str, ac_ids: set[str]) -> list[s
     return defects
 
 
+def validate_backlog(output: dict, story_ids: set[str]) -> list[str]:
+    defects: list[str] = []
+    backlog_ids = [entry["story_id"] for entry in output.get("backlog", [])]
+    unknown = sorted(set(backlog_ids) - story_ids)
+    if unknown:
+        defects.append(f"backlog references unknown stories: {', '.join(unknown)}")
+    missing = sorted(story_ids - set(backlog_ids))
+    if missing:
+        defects.append(f"backlog must rank every story; missing: {', '.join(missing)}")
+    if len(backlog_ids) != len(set(backlog_ids)):
+        defects.append("backlog ranks a story more than once")
+    priorities = [entry["priority"] for entry in output.get("backlog", [])]
+    if len(priorities) != len(set(priorities)):
+        defects.append("backlog priorities must be unique")
+
+    mvp = output.get("mvp_story_ids", [])
+    if len(mvp) != len(set(mvp)):
+        defects.append("duplicate ids in mvp_story_ids")
+    unknown_mvp = sorted(set(mvp) - story_ids)
+    if unknown_mvp:
+        defects.append(f"MVP references unknown stories: {', '.join(unknown_mvp)}")
+    cut = {entry["story_id"] for entry in output.get("cut_list", [])}
+    overlap = sorted(cut & set(mvp))
+    if overlap:
+        defects.append(f"stories both in MVP and cut list: {', '.join(overlap)}")
+    unknown_cut = sorted(cut - story_ids)
+    if unknown_cut:
+        defects.append(f"cut list references unknown stories: {', '.join(unknown_cut)}")
+    return defects
+
+
+def validate_wbs(output: dict, mvp_story_ids: set[str]) -> list[str]:
+    defects: list[str] = []
+    items = output.get("wbs_items", [])
+    ids = [item["id"] for item in items]
+    if len(ids) != len(set(ids)):
+        defects.append("duplicate WBS ids")
+    covered = {item["story_id"] for item in items}
+    unknown = sorted(covered - mvp_story_ids)
+    if unknown:
+        defects.append(f"WBS covers stories outside the MVP scope: {', '.join(unknown)}")
+    missing = sorted(mvp_story_ids - covered)
+    if missing:
+        defects.append(f"WBS does not cover MVP stories: {', '.join(missing)}")
+    for item in items:
+        low, high = item["confidence"]["low"], item["confidence"]["high"]
+        if not low <= item["estimate_points"] <= high:
+            defects.append(
+                f"{item['id']}: estimate {item['estimate_points']} outside "
+                f"confidence range [{low}, {high}]"
+            )
+    total = sum(item["estimate_points"] for item in items)
+    if output.get("total_points") != total:
+        defects.append(
+            f"total_points is {output.get('total_points')}, sum of estimates is {total}"
+        )
+    risk_ids = [risk["id"] for risk in output.get("risk_register", [])]
+    if len(risk_ids) != len(set(risk_ids)):
+        defects.append("duplicate risk ids")
+    return defects
+
+
+def validate_sprint_plan(output: dict, wbs_items: list[dict], capacity: int) -> list[str]:
+    defects: list[str] = []
+    points = {item["id"]: item["estimate_points"] for item in wbs_items}
+    known = set(points)
+
+    numbers = [sprint["number"] for sprint in output.get("sprints", [])]
+    if numbers != list(range(1, len(numbers) + 1)):
+        defects.append(f"sprint numbers must be 1..n consecutive, got {numbers}")
+
+    scheduled: dict[str, int] = {}
+    for sprint in output.get("sprints", []):
+        for wbs_id in sprint["wbs_ids"]:
+            if wbs_id in scheduled:
+                defects.append(f"{wbs_id} scheduled more than once")
+            scheduled[wbs_id] = sprint["number"]
+        load = sum(points.get(w, 0) for w in sprint["wbs_ids"])
+        if load > capacity:
+            defects.append(
+                f"sprint {sprint['number']} is over capacity: {load} > {capacity} points"
+            )
+    unknown = sorted(set(scheduled) - known)
+    if unknown:
+        defects.append(f"plan schedules unknown WBS items: {', '.join(unknown)}")
+    missing = sorted(known - set(scheduled))
+    if missing:
+        defects.append(f"plan does not schedule: {', '.join(missing)}")
+
+    deps = output.get("dependencies", [])
+    for dep in deps:
+        if dep["from"] == dep["to"]:
+            defects.append(f"{dep['from']} depends on itself")
+        for key in ("from", "to"):
+            if dep[key] not in known:
+                defects.append(f"dependency references unknown WBS item {dep[key]}")
+        if dep["from"] in scheduled and dep["to"] in scheduled:
+            if scheduled[dep["to"]] > scheduled[dep["from"]]:
+                defects.append(
+                    f"{dep['from']} (sprint {scheduled[dep['from']]}) depends on "
+                    f"{dep['to']} scheduled later (sprint {scheduled[dep['to']]})"
+                )
+    if _has_cycle(known, deps):
+        defects.append("dependency graph contains a cycle")
+
+    for milestone in output.get("milestones", []):
+        if milestone["sprint"] not in numbers:
+            defects.append(
+                f"milestone {milestone['name']!r} references unknown sprint {milestone['sprint']}"
+            )
+    return defects
+
+
+def _has_cycle(nodes: set[str], deps: list[dict]) -> bool:
+    """Kahn's algorithm; anything left unprocessed is on a cycle."""
+    incoming: dict[str, set[str]] = {n: set() for n in nodes}
+    outgoing: dict[str, set[str]] = {n: set() for n in nodes}
+    for dep in deps:
+        if dep["from"] in nodes and dep["to"] in nodes and dep["from"] != dep["to"]:
+            incoming[dep["from"]].add(dep["to"])
+            outgoing[dep["to"]].add(dep["from"])
+    ready = [n for n, blockers in incoming.items() if not blockers]
+    processed = 0
+    while ready:
+        node = ready.pop()
+        processed += 1
+        for dependent in outgoing[node]:
+            incoming[dependent].discard(node)
+            if not incoming[dependent]:
+                ready.append(dependent)
+    return processed != len(nodes)
+
+
+def topological_order(nodes: list[str], deps: list[dict]) -> list[str]:
+    """Stable topo order of WBS ids ("from" depends on "to")."""
+    node_set = set(nodes)
+    blockers: dict[str, set[str]] = {n: set() for n in nodes}
+    for dep in deps:
+        if dep["from"] in node_set and dep["to"] in node_set and dep["from"] != dep["to"]:
+            blockers[dep["from"]].add(dep["to"])
+    ordered: list[str] = []
+    remaining = list(nodes)
+    while remaining:
+        progress = [n for n in remaining if not (blockers[n] - set(ordered))]
+        if not progress:  # cycle — validation reports it; keep input order
+            ordered.extend(remaining)
+            break
+        ordered.extend(progress)
+        remaining = [n for n in remaining if n not in progress]
+    return ordered
+
+
+def validate_architecture(output: dict, mvp_story_ids: set[str]) -> list[str]:
+    defects: list[str] = []
+    covered: set[str] = set()
+    for component in output.get("components", []):
+        covered.update(component["story_ids"])
+    unknown = sorted(covered - mvp_story_ids)
+    if unknown:
+        defects.append(f"components reference stories outside MVP scope: {', '.join(unknown)}")
+    missing = sorted(mvp_story_ids - covered)
+    if missing:
+        defects.append(f"design does not cover MVP stories: {', '.join(missing)}")
+    adr_ids = [adr["id"] for adr in output.get("adrs", [])]
+    if len(adr_ids) != len(set(adr_ids)):
+        defects.append("duplicate ADR ids")
+    names = [c["name"] for c in output.get("components", [])]
+    if len(names) != len(set(names)):
+        defects.append("duplicate component names")
+    return defects
+
+
 def is_safe_relative_path(path: str) -> bool:
     if not path or path.startswith(("/", "\\")) or "\\" in path:
         return False

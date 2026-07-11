@@ -18,7 +18,8 @@ from typing import Any
 
 import jsonschema
 
-from pm_system.errors import AgentOutputError
+from pm_system.config import DEFAULT_MAX_CONTEXT_CHARS
+from pm_system.errors import AgentOutputError, ContextOverflowError
 from pm_system.llm.client import CostTags, MeteredLLM, extract_json
 
 PLAYBOOK_DIR = Path(__file__).resolve().parents[2] / "playbooks"
@@ -38,16 +39,32 @@ class Agent:
     role: str = "agent"
     output_schema: dict = {}
 
-    def __init__(self, llm: MeteredLLM, *, model: str, playbook_path: Path | None = None):
+    def __init__(
+        self,
+        llm: MeteredLLM,
+        *,
+        model: str,
+        playbook_path: Path | None = None,
+        max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
+    ):
         self.llm = llm
         self.model = model
+        self.max_context_chars = max_context_chars
         path = playbook_path or PLAYBOOK_DIR / f"{self.role}.md"
         self.playbook = path.read_text() if path.exists() else ""
 
     def run(self, context: ContextPackage, tags: CostTags) -> dict:
+        system = self.system_prompt()
+        prompt = self.user_prompt(context)
+        total = len(system) + len(prompt)
+        if total > self.max_context_chars:
+            raise ContextOverflowError(
+                f"{self.role} context package is {total} chars, "
+                f"cap is {self.max_context_chars}"
+            )
         response = self.llm.complete(
-            system=self.system_prompt(),
-            prompt=self.user_prompt(context),
+            system=system,
+            prompt=prompt,
             model=self.model,
             tags=tags,
         )

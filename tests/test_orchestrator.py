@@ -1,4 +1,4 @@
-"""End-to-end tests of the Phase 1 state machine on a one-story mini project."""
+"""End-to-end tests of the Phase 1+2 state machine on a one-story mini project."""
 
 import json
 import sys
@@ -6,7 +6,11 @@ import sys
 import pytest
 
 from pm_system.agents.analyst import AnalystAgent
+from pm_system.agents.architect import ArchitectAgent
 from pm_system.agents.developer import DeveloperAgent
+from pm_system.agents.estimator import EstimatorAgent
+from pm_system.agents.planner import PlannerAgent
+from pm_system.agents.product_owner import ProductOwnerAgent
 from pm_system.agents.qa import QAAgent
 from pm_system.artifacts.store import ArtifactStatus, ArtifactStore
 from pm_system.config import OrchestratorConfig
@@ -35,6 +39,65 @@ PRD = json.dumps(
                 ],
             }
         ],
+    }
+)
+
+BACKLOG = json.dumps(
+    {
+        "mvp_story_ids": ["US-001"],
+        "backlog": [
+            {"story_id": "US-001", "priority": 1, "rationale": "core capability"}
+        ],
+        "cut_list": [],
+    }
+)
+
+WBS = json.dumps(
+    {
+        "wbs_items": [
+            {
+                "id": "WBS-001",
+                "story_id": "US-001",
+                "description": "greet function with tests",
+                "estimate_points": 2,
+                "confidence": {"low": 1, "high": 3},
+            }
+        ],
+        "risk_register": [],
+        "total_points": 2,
+    }
+)
+
+PLAN = json.dumps(
+    {
+        "sprints": [{"number": 1, "goal": "ship greeter", "wbs_ids": ["WBS-001"]}],
+        "dependencies": [],
+        "milestones": [{"name": "MVP", "sprint": 1}],
+    }
+)
+
+ARCH = json.dumps(
+    {
+        "overview": "Single pure-function module.",
+        "components": [
+            {
+                "name": "greeter-core",
+                "responsibility": "greeting formatting",
+                "story_ids": ["US-001"],
+            }
+        ],
+        "adrs": [
+            {
+                "id": "ADR-001",
+                "title": "pure function, no classes",
+                "context": "single stateless operation",
+                "decision": "module-level function",
+                "alternatives": ["Greeter class"],
+                "consequences": "trivially testable",
+            }
+        ],
+        "api_contracts": [],
+        "data_model": [],
     }
 )
 
@@ -81,44 +144,54 @@ class ScriptedGate(HumanGate):
         self.digests = []
 
     def request_approval(self, gate_name, digest):
-        self.digests.append(digest)
+        self.digests.append((gate_name, digest))
         return self.decisions.pop(0)
 
 
 def make_orchestrator(
     tmp_path,
     *,
-    analyst_responses,
-    dev_responses,
-    qa_responses,
+    analyst_responses=None,
+    po_responses=None,
+    estimator_responses=None,
+    planner_responses=None,
+    architect_responses=None,
+    dev_responses=None,
+    qa_responses=None,
     gate=None,
+    gate2=None,
     ledger=None,
+    config=None,
 ):
     store = ArtifactStore()
     ledger = ledger or CostLedger()
+
+    def metered(responses):
+        return MeteredLLM(MockLLM(responses if responses is not None else []), ledger)
+
     orchestrator = Orchestrator(
         store=store,
         ledger=ledger,
-        analyst=AnalystAgent(MeteredLLM(MockLLM(analyst_responses), ledger), model="test-sonnet"),
-        developer=DeveloperAgent(MeteredLLM(MockLLM(dev_responses), ledger), model="test-sonnet"),
-        qa=QAAgent(MeteredLLM(MockLLM(qa_responses), ledger), model="test-sonnet"),
+        analyst=AnalystAgent(metered(analyst_responses or [PRD]), model="test-sonnet"),
+        product_owner=ProductOwnerAgent(metered(po_responses or [BACKLOG]), model="test-sonnet"),
+        estimator=EstimatorAgent(metered(estimator_responses or [WBS]), model="test-sonnet"),
+        planner=PlannerAgent(metered(planner_responses or [PLAN]), model="test-sonnet"),
+        architect=ArchitectAgent(metered(architect_responses or [ARCH]), model="test-sonnet"),
+        developer=DeveloperAgent(metered(dev_responses or [_dev_response(GOOD_CODE)]), model="test-sonnet"),
+        qa=QAAgent(metered(qa_responses or [QA_RESPONSE]), model="test-sonnet"),
         gate=gate or AutoApproveGate(),
+        gate2=gate2,
         sandbox=LocalSandbox(),
         workspace_root=tmp_path / "workspaces",
         notifier=NullNotifier(),
-        config=OrchestratorConfig(sandbox_timeout=120),
+        config=config or OrchestratorConfig(sandbox_timeout=120),
         test_python=sys.executable,
     )
     return orchestrator, store, ledger
 
 
 def test_happy_path_end_to_end(tmp_path):
-    orchestrator, store, ledger = make_orchestrator(
-        tmp_path,
-        analyst_responses=[PRD],
-        dev_responses=[_dev_response(GOOD_CODE)],
-        qa_responses=[QA_RESPONSE],
-    )
+    orchestrator, store, ledger = make_orchestrator(tmp_path)
     result = orchestrator.run_project("proj", "greeting library")
 
     assert result.status == "completed"
@@ -128,30 +201,33 @@ def test_happy_path_end_to_end(tmp_path):
     assert result.first_try_validation_rate == 1.0
     assert result.total_cost_usd > 0
 
-    # artifacts: PRD approved, ticket, code, and QA report all traced
-    assert store.get("proj:PRD").status == ArtifactStatus.APPROVED
-    assert store.get("proj:TCK-001").trace_ids == ("US-001",)
-    assert store.get("proj:CODE-TCK-001").trace_ids == ("TCK-001", "US-001")
-    assert set(store.get("proj:QA-TCK-001").trace_ids) == {"TCK-001", "AC-001"}
+    # gate 1 approved the whole upstream chain; gate 2 approved the design
+    for suffix in ("PRD", "BACKLOG", "WBS", "PLAN", "ARCH"):
+        assert store.get(f"proj:{suffix}").status == ArtifactStatus.APPROVED
 
-    # code landed in the workspace and cost is attributed per stage
+    # traceability: ticket -> WBS + story; code -> ticket + WBS + story
+    assert store.get("proj:TCK-001").trace_ids == ("WBS-001", "US-001")
+    assert store.get("proj:CODE-TCK-001").trace_ids == ("TCK-001", "WBS-001", "US-001")
+    assert set(store.get("proj:QA-TCK-001").trace_ids) == {"TCK-001", "AC-001"}
+    depends_on_story = {a.artifact_id for a in store.find_by_trace("proj", "US-001")}
+    assert {"proj:PRD", "proj:TCK-001", "proj:CODE-TCK-001"} <= depends_on_story
+
+    # code landed and cost is attributed per stage across the whole pipeline
     assert (result.workspace / "greeter.py").exists()
-    assert set(ledger.summary("proj")) == {"intake", "build", "qa"}
+    assert set(ledger.summary("proj")) == {
+        "intake", "scope", "estimate", "plan", "architecture", "build", "qa",
+    }
 
 
 def test_dev_failure_retries_with_bug_report(tmp_path):
     orchestrator, _, _ = make_orchestrator(
         tmp_path,
-        analyst_responses=[PRD],
         dev_responses=[_dev_response(BROKEN_CODE), _dev_response(GOOD_CODE)],
-        qa_responses=[QA_RESPONSE],
     )
     result = orchestrator.run_project("proj", "greeting library")
 
     assert result.status == "completed"
     assert result.tickets[0].attempts == 2
-    # broken first try drags the first-try rate below 100%
-    assert result.first_try_validation_rate == 1.0  # schema was valid both times
 
     # the retry prompt contained the failing test output
     dev_client = orchestrator.developer.llm.client
@@ -161,7 +237,6 @@ def test_dev_failure_retries_with_bug_report(tmp_path):
 def test_retry_cap_escalates_to_human(tmp_path):
     orchestrator, store, _ = make_orchestrator(
         tmp_path,
-        analyst_responses=[PRD],
         dev_responses=[_dev_response(BROKEN_CODE)] * 3,
         qa_responses=[],  # QA is never reached
     )
@@ -171,41 +246,49 @@ def test_retry_cap_escalates_to_human(tmp_path):
     assert result.tickets[0].status == "escalated"
     assert result.tickets[0].attempts == 3
     assert result.escalations
-    # no code artifact was approved for the failed ticket
     with pytest.raises(Exception):
         store.get("proj:CODE-TCK-001")
 
 
-def test_gate_rejection_routes_feedback_and_reversions(tmp_path):
+def test_gate1_rejection_routes_feedback_to_product_owner(tmp_path):
     gate = ScriptedGate(
-        [GateDecision(False, "split the story further"), GateDecision(True)]
+        [
+            GateDecision(False, "cut scope further"),  # gate 1, round 1
+            GateDecision(True),  # gate 1, round 2
+            GateDecision(True),  # gate 2
+        ]
     )
     orchestrator, store, _ = make_orchestrator(
         tmp_path,
-        analyst_responses=[PRD, PRD],
-        dev_responses=[_dev_response(GOOD_CODE)],
-        qa_responses=[QA_RESPONSE],
+        po_responses=[BACKLOG, BACKLOG],
+        estimator_responses=[WBS, WBS],
+        planner_responses=[PLAN, PLAN],
         gate=gate,
     )
     result = orchestrator.run_project("proj", "greeting library")
 
     assert result.status == "completed"
-    history = store.history("proj:PRD")
-    assert [a.version for a in history] == [1, 2]
-    assert history[0].status == ArtifactStatus.SUPERSEDED
-    assert history[1].status == ArtifactStatus.APPROVED
-    # the rejection reason reached the analyst
-    analyst_client = orchestrator.analyst.llm.client
-    assert "split the story further" in analyst_client.calls[1][1]
+    # the rejection reason reached the Product Owner, not the Analyst
+    po_client = orchestrator.product_owner.llm.client
+    assert "cut scope further" in po_client.calls[1][1]
+    assert len(orchestrator.analyst.llm.client.calls) == 1
+    # the whole planning chain re-ran: new versions of backlog/wbs/plan
+    for suffix in ("BACKLOG", "WBS", "PLAN"):
+        history = store.history(f"proj:{suffix}")
+        assert [a.version for a in history] == [1, 2]
+        assert history[0].status == ArtifactStatus.SUPERSEDED
+        assert history[1].status == ArtifactStatus.APPROVED
+    # the PRD was not re-drafted
+    assert [a.version for a in store.history("proj:PRD")] == [1]
 
 
-def test_gate_rejections_exhaust_retry_cap(tmp_path):
+def test_gate1_rejections_exhaust_retry_cap(tmp_path):
     gate = ScriptedGate([GateDecision(False, "no")] * 3)
     orchestrator, _, _ = make_orchestrator(
         tmp_path,
-        analyst_responses=[PRD] * 3,
-        dev_responses=[],
-        qa_responses=[],
+        po_responses=[BACKLOG] * 3,
+        estimator_responses=[WBS] * 3,
+        planner_responses=[PLAN] * 3,
         gate=gate,
     )
     result = orchestrator.run_project("proj", "greeting library")
@@ -213,17 +296,78 @@ def test_gate_rejections_exhaust_retry_cap(tmp_path):
     assert "not approved" in result.escalations[0]
 
 
-def test_budget_hard_stop(tmp_path):
-    ledger = CostLedger(stage_budgets={"intake": 0.0})
-    orchestrator, _, _ = make_orchestrator(
-        tmp_path,
-        analyst_responses=[PRD],
-        dev_responses=[],
-        qa_responses=[],
-        ledger=ledger,
+def test_gate2_rejection_routes_feedback_to_architect(tmp_path):
+    gate = ScriptedGate(
+        [
+            GateDecision(True),  # gate 1
+            GateDecision(False, "missing failure-mode ADR"),  # gate 2, round 1
+            GateDecision(True),  # gate 2, round 2
+        ]
+    )
+    orchestrator, store, _ = make_orchestrator(
+        tmp_path, architect_responses=[ARCH, ARCH], gate=gate
     )
     result = orchestrator.run_project("proj", "greeting library")
+
+    assert result.status == "completed"
+    architect_client = orchestrator.architect.llm.client
+    assert "missing failure-mode ADR" in architect_client.calls[1][1]
+    assert [a.version for a in store.history("proj:ARCH")] == [1, 2]
+
+
+def test_gate2_can_be_disabled(tmp_path):
+    gate = ScriptedGate([GateDecision(True)])  # only gate 1 fires
+    orchestrator, store, _ = make_orchestrator(
+        tmp_path,
+        gate=gate,
+        config=OrchestratorConfig(sandbox_timeout=120, gate2_enabled=False),
+    )
+    result = orchestrator.run_project("proj", "greeting library")
+    assert result.status == "completed"
+    assert len(gate.digests) == 1
+    assert store.get("proj:ARCH").status == ArtifactStatus.APPROVED
+
+
+def test_invalid_planning_output_is_retried_with_defects(tmp_path):
+    bad_wbs = json.dumps(
+        {
+            "wbs_items": [
+                {
+                    "id": "WBS-001",
+                    "story_id": "US-001",
+                    "description": "greet function",
+                    "estimate_points": 2,
+                    "confidence": {"low": 1, "high": 3},
+                }
+            ],
+            "risk_register": [],
+            "total_points": 99,  # inconsistent with the sum
+        }
+    )
+    orchestrator, _, _ = make_orchestrator(
+        tmp_path, estimator_responses=[bad_wbs, WBS]
+    )
+    result = orchestrator.run_project("proj", "greeting library")
+    assert result.status == "completed"
+    estimator_client = orchestrator.estimator.llm.client
+    assert "total_points" in estimator_client.calls[1][1]
+    # wbs failed first try -> rate below 100%
+    assert result.first_try_validation_rate == pytest.approx(6 / 7)
+
+
+def test_budget_hard_stop(tmp_path):
+    ledger = CostLedger(stage_budgets={"intake": 0.0})
+    orchestrator, _, _ = make_orchestrator(tmp_path, ledger=ledger)
+    result = orchestrator.run_project("proj", "greeting library")
     assert result.status == "budget_exceeded"
+
+
+def test_context_cap_escalates(tmp_path):
+    orchestrator, _, _ = make_orchestrator(tmp_path)
+    orchestrator.analyst.max_context_chars = 50  # force overflow
+    result = orchestrator.run_project("proj", "greeting library")
+    assert result.status == "escalated"
+    assert "context cap exceeded" in result.escalations[0]
 
 
 def test_d3_same_llm_instance_for_dev_and_qa_is_refused(tmp_path):
@@ -234,6 +378,10 @@ def test_d3_same_llm_instance_for_dev_and_qa_is_refused(tmp_path):
             store=ArtifactStore(),
             ledger=ledger,
             analyst=AnalystAgent(shared, model="m"),
+            product_owner=ProductOwnerAgent(shared, model="m"),
+            estimator=EstimatorAgent(shared, model="m"),
+            planner=PlannerAgent(shared, model="m"),
+            architect=ArchitectAgent(shared, model="m"),
             developer=DeveloperAgent(shared, model="m"),
             qa=QAAgent(shared, model="m"),
             gate=AutoApproveGate(),
@@ -244,12 +392,9 @@ def test_d3_same_llm_instance_for_dev_and_qa_is_refused(tmp_path):
 
 def test_invalid_analyst_output_counts_against_first_try_rate(tmp_path):
     orchestrator, _, _ = make_orchestrator(
-        tmp_path,
-        analyst_responses=["not json", PRD],
-        dev_responses=[_dev_response(GOOD_CODE)],
-        qa_responses=[QA_RESPONSE],
+        tmp_path, analyst_responses=["not json", PRD]
     )
     result = orchestrator.run_project("proj", "greeting library")
     assert result.status == "completed"
-    # prd failed first try; code and qa passed first try -> 2/3
-    assert result.first_try_validation_rate == pytest.approx(2 / 3)
+    # prd failed first try; backlog/wbs/plan/arch/code/qa passed -> 6/7
+    assert result.first_try_validation_rate == pytest.approx(6 / 7)

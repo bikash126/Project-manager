@@ -37,6 +37,14 @@ class UnsafePathError(PMSystemError):
     pass
 
 
+class ContextOverflowError(PMSystemError):
+    """A curated context package exceeded the role's hard size cap.
+
+    Not retryable by the agent — the orchestrator assembled the package, so
+    this escalates instead of counting toward an agent's retry cap.
+    """
+
+
 class AgentOutputError(PMSystemError):
     """Agent output failed JSON parsing or schema validation."""
 

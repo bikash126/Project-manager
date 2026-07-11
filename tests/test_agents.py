@@ -45,6 +45,17 @@ def test_agent_rejects_schema_violation():
     assert "schema violation" in excinfo.value.defects[0]
 
 
+def test_context_cap_is_a_hard_stop():
+    from pm_system.errors import ContextOverflowError
+
+    agent = _analyst([VALID_PRD])
+    agent.max_context_chars = 100
+    with pytest.raises(ContextOverflowError):
+        agent.run(ContextPackage(instructions="x" * 200), TAGS)
+    # nothing was spent: the cap fires before the LLM call
+    assert agent.llm.client.calls == []
+
+
 def test_prompt_includes_playbook_feedback_and_artifacts():
     agent = _analyst([VALID_PRD])
     assert "Analyst Playbook" in agent.system_prompt()

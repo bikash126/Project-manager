@@ -15,22 +15,34 @@ import sys
 import tempfile
 from pathlib import Path
 
-from examples.toy_responses import ANALYST_RESPONSES, DEVELOPER_RESPONSES, QA_RESPONSES
+from examples.toy_responses import (
+    ANALYST_RESPONSES,
+    ARCHITECT_RESPONSES,
+    DEVELOPER_RESPONSES,
+    ESTIMATOR_RESPONSES,
+    PLANNER_RESPONSES,
+    PRODUCT_OWNER_RESPONSES,
+    QA_RESPONSES,
+)
 from pm_system import (
     AnalystAgent,
+    ArchitectAgent,
     ArtifactStore,
     AutoApproveGate,
     ConsoleGate,
     ConsoleNotifier,
     CostLedger,
     DeveloperAgent,
+    EstimatorAgent,
     MeteredLLM,
     MockLLM,
     Orchestrator,
     OrchestratorConfig,
+    PlannerAgent,
+    ProductOwnerAgent,
     QAAgent,
 )
-from pm_system.config import STRONG_MODEL
+from pm_system.config import MID_MODEL, STRONG_MODEL
 from pm_system.sandbox.runner import DockerSandbox, LocalSandbox, default_sandbox
 
 
@@ -49,12 +61,24 @@ def main(argv=None) -> int:
     workspace_root = args.workspace or Path(tempfile.mkdtemp(prefix="pm-toy-"))
 
     store = ArtifactStore()
-    ledger = CostLedger(stage_budgets={"intake": 5.0, "build": 20.0, "qa": 10.0})
+    ledger = CostLedger(
+        stage_budgets={
+            "intake": 5.0, "scope": 5.0, "estimate": 5.0, "plan": 5.0,
+            "architecture": 10.0, "build": 20.0, "qa": 10.0,
+        }
+    )
 
     # One MockLLM per role: QA runs on a separate instance from the Developer (D3).
-    analyst = AnalystAgent(MeteredLLM(MockLLM(ANALYST_RESPONSES), ledger), model=STRONG_MODEL)
-    developer = DeveloperAgent(MeteredLLM(MockLLM(DEVELOPER_RESPONSES), ledger), model=STRONG_MODEL)
-    qa = QAAgent(MeteredLLM(MockLLM(QA_RESPONSES), ledger), model=STRONG_MODEL)
+    def metered(responses):
+        return MeteredLLM(MockLLM(responses), ledger)
+
+    analyst = AnalystAgent(metered(ANALYST_RESPONSES), model=STRONG_MODEL)
+    product_owner = ProductOwnerAgent(metered(PRODUCT_OWNER_RESPONSES), model=STRONG_MODEL)
+    estimator = EstimatorAgent(metered(ESTIMATOR_RESPONSES), model=MID_MODEL)
+    planner = PlannerAgent(metered(PLANNER_RESPONSES), model=MID_MODEL)
+    architect = ArchitectAgent(metered(ARCHITECT_RESPONSES), model=STRONG_MODEL)
+    developer = DeveloperAgent(metered(DEVELOPER_RESPONSES), model=STRONG_MODEL)
+    qa = QAAgent(metered(QA_RESPONSES), model=STRONG_MODEL)
 
     if args.sandbox == "local":
         sandbox = LocalSandbox()
@@ -70,6 +94,10 @@ def main(argv=None) -> int:
         store=store,
         ledger=ledger,
         analyst=analyst,
+        product_owner=product_owner,
+        estimator=estimator,
+        planner=planner,
+        architect=architect,
         developer=developer,
         qa=qa,
         gate=ConsoleGate() if args.gate == "console" else AutoApproveGate(),
@@ -97,6 +125,10 @@ def main(argv=None) -> int:
             f"  {artifact.artifact_id} v{artifact.version} [{artifact.status.value}] "
             f"type={artifact.artifact_type} trace={list(artifact.trace_ids)}"
         )
+
+    print("\n=== Traceability: what depends on US-001? ===")
+    for artifact in store.find_by_trace("toy-temp-converter", "US-001"):
+        print(f"  {artifact.artifact_id} ({artifact.artifact_type})")
     return 0 if result.status == "completed" else 1
 
 

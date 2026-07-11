@@ -216,6 +216,114 @@ QA_TICKET_2 = _fenced(
     }
 )
 
+BACKLOG = _fenced(
+    {
+        "mvp_story_ids": ["US-001", "US-002"],
+        "backlog": [
+            {
+                "story_id": "US-001",
+                "priority": 1,
+                "rationale": "Conversion is the product's core promise; nothing works without it.",
+            },
+            {
+                "story_id": "US-002",
+                "priority": 2,
+                "rationale": "A CLI that crashes on bad input is unusable; validation completes the MVP.",
+            },
+        ],
+        "cut_list": [],
+    }
+)
+
+WBS = _fenced(
+    {
+        "wbs_items": [
+            {
+                "id": "WBS-001",
+                "story_id": "US-001",
+                "description": "Conversion module: c_to_f / f_to_c with unit tests",
+                "estimate_points": 3,
+                "confidence": {"low": 2, "high": 5},
+            },
+            {
+                "id": "WBS-002",
+                "story_id": "US-002",
+                "description": "argparse CLI with input validation and exit codes",
+                "estimate_points": 2,
+                "confidence": {"low": 1, "high": 4},
+            },
+        ],
+        "risk_register": [
+            {
+                "id": "RISK-001",
+                "description": "Floating-point formatting differs across platforms",
+                "likelihood": "low",
+                "impact": "low",
+                "mitigation": "format with %g and pin expected strings in tests",
+            }
+        ],
+        "total_points": 5,
+    }
+)
+
+SPRINT_PLAN = _fenced(
+    {
+        "sprints": [
+            {
+                "number": 1,
+                "goal": "Working converter CLI: conversions plus input validation",
+                "wbs_ids": ["WBS-001", "WBS-002"],
+            }
+        ],
+        "dependencies": [{"from": "WBS-002", "to": "WBS-001"}],
+        "milestones": [{"name": "MVP complete", "sprint": 1}],
+    }
+)
+
+ARCHITECTURE = _fenced(
+    {
+        "overview": (
+            "Two-layer CLI tool: a pure conversion module with no I/O, wrapped by a "
+            "thin argparse CLI that owns validation and exit codes."
+        ),
+        "components": [
+            {
+                "name": "conversion-core",
+                "responsibility": "Pure Celsius/Fahrenheit conversion functions and constants",
+                "story_ids": ["US-001"],
+            },
+            {
+                "name": "cli",
+                "responsibility": "Argument parsing, input validation, error reporting, exit codes",
+                "story_ids": ["US-002"],
+            },
+        ],
+        "adrs": [
+            {
+                "id": "ADR-001",
+                "title": "argparse over third-party CLI frameworks",
+                "context": "The CLI has two positional arguments and no subcommands.",
+                "decision": "Use stdlib argparse; no dependencies.",
+                "alternatives": ["click", "docopt"],
+                "consequences": "Zero install footprint; manual help text if the CLI grows.",
+            }
+        ],
+        "api_contracts": [
+            {
+                "name": "convert",
+                "description": "c_to_f(celsius: float) -> float and f_to_c(fahrenheit: float) -> float",
+                "request": "float temperature value",
+                "response": "float converted value",
+            }
+        ],
+        "data_model": [],
+    }
+)
+
 ANALYST_RESPONSES = [PRD]
+PRODUCT_OWNER_RESPONSES = [BACKLOG]
+ESTIMATOR_RESPONSES = [WBS]
+PLANNER_RESPONSES = [SPRINT_PLAN]
+ARCHITECT_RESPONSES = [ARCHITECTURE]
 DEVELOPER_RESPONSES = [DEV_TICKET_1, DEV_TICKET_2]
 QA_RESPONSES = [QA_TICKET_1, QA_TICKET_2]
