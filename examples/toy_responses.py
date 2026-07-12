@@ -464,3 +464,23 @@ CR_NEW_ACCEPTANCE_CRITERIA = [
     {"id": "AC-001", "given": "100 Celsius", "when": "converting to Fahrenheit", "then": "212"},
     {"id": "AC-002", "given": "37 Celsius", "when": "converting to Fahrenheit", "then": "98.6"},
 ]
+
+# Operate + learn demo fixtures (Phase 6).
+RETRO_LESSONS = _fenced(
+    {
+        "lessons": [
+            {"category": "process", "lesson": "contract-first design kept the two tickets independent"},
+            {"category": "quality", "lesson": "acceptance tests caught the rounding edge case early"},
+        ]
+    }
+)
+OPS_INCIDENT = _fenced(
+    {
+        "actionable": True,
+        "severity": "high",
+        "triage": "converter returns 500 on integer-valued input from the API",
+        "recommend_rollback": False,
+        "target_story_id": "US-001",
+        "fix_summary": "accept integer temperature values, not just floats",
+    }
+)

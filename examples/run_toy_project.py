@@ -28,12 +28,14 @@ from examples.toy_responses import (
     DOCS,
     DOCS_RESPONSES,
     ESTIMATOR_RESPONSES,
+    OPS_INCIDENT,
     PLANNER_RESPONSES,
     PRODUCT_OWNER_RESPONSES,
     QA_RESPONSES,
     QA_TICKET_1,
     RELEASE_PATCH,
     RELEASE_RESPONSES,
+    RETRO_LESSONS,
     REVIEW_TICKET_1,
     REVIEWER_RESPONSES,
     SECURITY_CONFIRM,
@@ -52,14 +54,18 @@ from pm_system import (
     DevOpsAgent,
     DocWriterAgent,
     EstimatorAgent,
+    KnowledgeBase,
     MeteredLLM,
     MockLLM,
+    OpsAgent,
     Orchestrator,
     OrchestratorConfig,
     PlannerAgent,
+    ProdIncident,
     ProductOwnerAgent,
     QAAgent,
     ReleaseManagerAgent,
+    RetrospectiveAgent,
     ReviewerAgent,
     SecurityAgent,
 )
@@ -88,6 +94,12 @@ def main(argv=None) -> int:
         action="store_true",
         help="after shipping, raise a CR that amends US-001 and show that only "
         "the blast radius re-runs (Phase 5)",
+    )
+    parser.add_argument(
+        "--incident",
+        action="store_true",
+        help="after shipping, feed a prod incident to Ops; an actionable one is "
+        "triaged into a fix that re-enters the dev loop (Phase 6)",
     )
     args = parser.parse_args(argv)
 
@@ -120,14 +132,19 @@ def main(argv=None) -> int:
     qa_responses = list(QA_RESPONSES)
     release_responses = list(RELEASE_RESPONSES)
     docs_responses = list(DOCS_RESPONSES)
-    if args.change_request:
-        # extra responses to re-run TCK-001 and re-ship a patch after the CR
-        po_responses += [CR_TRIAGE_ACCEPT]
-        dev_responses += [DEV_TICKET_1]
-        reviewer_responses += [REVIEW_TICKET_1]
-        qa_responses += [QA_TICKET_1]
-        release_responses += [RELEASE_PATCH]
-        docs_responses += [DOCS]
+    ops_responses = []
+    # A CR (Phase 5) or an actionable incident (Phase 6) both re-run TCK-001 and
+    # re-ship a patch, so each needs the same extra responses.
+    for flag in (args.change_request, args.incident):
+        if flag:
+            po_responses += [CR_TRIAGE_ACCEPT]
+            dev_responses += [DEV_TICKET_1]
+            reviewer_responses += [REVIEW_TICKET_1]
+            qa_responses += [QA_TICKET_1]
+            release_responses += [RELEASE_PATCH]
+            docs_responses += [DOCS]
+    if args.incident:
+        ops_responses = [OPS_INCIDENT]
 
     analyst = AnalystAgent(metered(ANALYST_RESPONSES), model=STRONG_MODEL)
     product_owner = ProductOwnerAgent(metered(po_responses), model=STRONG_MODEL)
@@ -142,6 +159,9 @@ def main(argv=None) -> int:
     devops = DevOpsAgent(metered(DEVOPS_RESPONSES), model=MID_MODEL)
     release_manager = ReleaseManagerAgent(metered(release_responses), model=CHEAP_MODEL)
     doc_writer = DocWriterAgent(metered(docs_responses), model=CHEAP_MODEL)
+    ops = OpsAgent(metered(ops_responses), model=MID_MODEL)
+    retrospective = RetrospectiveAgent(metered([RETRO_LESSONS]), model=CHEAP_MODEL)
+    kb = KnowledgeBase()
 
     if args.sandbox == "local":
         sandbox = LocalSandbox()
@@ -169,6 +189,9 @@ def main(argv=None) -> int:
         devops=devops,
         release_manager=release_manager,
         doc_writer=doc_writer,
+        ops=ops,
+        retrospective_agent=retrospective,
+        kb=kb,
         gate=ConsoleGate() if args.gate == "console" else AutoApproveGate(),
         sandbox=sandbox,
         workspace_root=workspace_root,
@@ -195,6 +218,7 @@ def main(argv=None) -> int:
     print(f"security findings: {result.security_findings_total} ({result.security_blocks_total} blocking)")
     print(f"shipped: {result.shipped} (version {result.release_version})  [P4 exit: shipped end-to-end]")
     print(f"human interventions: {result.human_interventions}")
+    print(f"KB entries written by retrospective: {result.kb_entries_written}  [P6 exit: retrospective -> KB]")
     print(f"total cost: ${result.total_cost_usd:.4f}")
     print(f"workspace: {result.workspace}")
 
@@ -232,6 +256,32 @@ def main(argv=None) -> int:
             if a.artifact_id not in change.blast_radius
         ]
         print(f"  untouched ({len(untouched)}): {sorted(untouched)}")
+
+    if args.incident and result.shipped:
+        incident = ProdIncident(
+            "INC-001",
+            "Converter returns 500 on integer-valued input from the API",
+            logs="ValueError: could not convert ... (see US-001)",
+        )
+        outcome = orchestrator.handle_incident("toy-temp-converter", incident)
+        print("\n=== Prod incident INC-001 ===")
+        print(f"severity: {outcome.severity}; decision: {outcome.decision}")
+        print(f"triage: {outcome.triage}")
+        if outcome.change_result is not None:
+            print(
+                f"fix re-entered the dev loop -> tickets "
+                f"{[t.ticket_id for t in outcome.change_result.rerun_tickets]}, "
+                f"new version {outcome.change_result.new_version}"
+            )
+        print(f"rolled back: {outcome.rolled_back}")
+
+    if args.change_request or args.incident:
+        cal = kb.calibration_summary()
+        print(
+            f"\nKB now holds {len(kb.query())} entries; "
+            f"calibration multiplier {cal['multiplier']} from {cal['samples']} sample(s) "
+            "(fed to the next project's Estimator)"
+        )
 
     return 0 if result.status == "completed" else 1
 

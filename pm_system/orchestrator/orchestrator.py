@@ -31,6 +31,13 @@ Change requests (Phase 5, apply_change_request) reuse the same machinery:
 Product Owner triages, traceability IDs pin the blast radius, a large delta
 goes to a gate, affected artifacts flip to `stale`, and only those re-run.
 
+Operate + learn (Phase 6): handle_incident runs the Ops triage — an actionable
+prod error becomes a fix that re-enters the dev loop via the CR machinery, and
+a rollback needs human confirm. At project close the retrospective mines the
+run into the Knowledge Base (estimate-vs-actual calibration, failure patterns,
+reusable ADRs, lessons), which the Estimator and Architect read on the next
+project.
+
 The orchestrator never writes code, designs, or docs itself; it curates
 context packages, validates outputs, enforces gates/retries/budgets/context
 caps, and emits a status digest on every stage transition.
@@ -50,10 +57,12 @@ from pm_system.agents.developer import DeveloperAgent
 from pm_system.agents.devops import DevOpsAgent
 from pm_system.agents.doc_writer import DocWriterAgent
 from pm_system.agents.estimator import EstimatorAgent
+from pm_system.agents.ops import OpsAgent
 from pm_system.agents.planner import PlannerAgent
 from pm_system.agents.product_owner import ProductOwnerAgent
 from pm_system.agents.qa import QAAgent
 from pm_system.agents.release_manager import ReleaseManagerAgent
+from pm_system.agents.retrospective import RetrospectiveAgent
 from pm_system.agents.reviewer import ReviewerAgent
 from pm_system.agents.security import SecurityAgent
 from pm_system.artifacts.store import Artifact, ArtifactStatus, ArtifactStore
@@ -69,9 +78,17 @@ from pm_system.errors import (
 from pm_system.gates.gate import GateDecision, HumanGate
 from pm_system.llm.client import CostTags
 from pm_system.notify.notifier import ConsoleNotifier, Notifier
+from pm_system.kb.store import (
+    KIND_ADR,
+    KIND_CALIBRATION,
+    KIND_FAILURE,
+    KIND_LESSON,
+    KnowledgeBase,
+)
 from pm_system.orchestrator.change import CR_TRIAGE_SCHEMA, ChangeRequest, ChangeResult
 from pm_system.orchestrator.deploy import Deployer, NullDeployer
 from pm_system.orchestrator.git_workspace import GitWorkspace, NullGitWorkspace
+from pm_system.orchestrator.incident import IncidentResult, ProdIncident
 from pm_system.orchestrator.pr import NullPRPublisher, PRPublisher, Verdict
 from pm_system.orchestrator.validation import (
     safe_write,
@@ -166,6 +183,8 @@ class ProjectResult:
     release_version: str | None = None
     # Phase 4 metric: how many times a human had to engage (gates + escalations).
     human_interventions: int = 0
+    # Phase 6 operate + learn
+    kb_entries_written: int = 0
 
 
 DEFAULT_STANDARDS_PATH = Path(__file__).resolve().parents[2] / "standards" / "coding_standards.md"
@@ -193,10 +212,13 @@ class Orchestrator:
         devops: DevOpsAgent | None = None,
         release_manager: ReleaseManagerAgent | None = None,
         doc_writer: DocWriterAgent | None = None,
+        ops: OpsAgent | None = None,
+        retrospective_agent: RetrospectiveAgent | None = None,
         scan_suite: SecurityScanSuite | None = None,
         license_checker: LicenseChecker | None = None,
         pr_publisher: PRPublisher | None = None,
         deployer: Deployer | None = None,
+        kb: KnowledgeBase | None = None,
         gate2: HumanGate | None = None,
         gate3: HumanGate | None = None,
         notifier: Notifier | None = None,
@@ -249,10 +271,13 @@ class Orchestrator:
         self.devops = devops
         self.release_manager = release_manager
         self.doc_writer = doc_writer
+        self.ops = ops
+        self.retrospective_agent = retrospective_agent
         self.scan_suite = scan_suite or SecurityScanSuite()
         self.license_checker = license_checker or LicenseChecker()
         self.pr_publisher = pr_publisher or NullPRPublisher()
         self.deployer = deployer or NullDeployer()
+        self.kb = kb
         self.gate = gate
         self.gate2 = gate2 or gate
         self.gate3 = gate3 or gate
@@ -266,12 +291,15 @@ class Orchestrator:
         self.standards = path.read_text() if path.exists() else ""
         self.tracker = ValidationTracker()
         self._interventions = 0
+        self._deployments: dict[str, object] = {}  # project_id -> latest Deployment
+        self._lessons: list[str] = []  # within-project lessons buffer (design §6)
 
     # ------------------------------------------------------------------ api
 
     def run_project(self, project_id: str, raw_idea: str, constraints: str = "") -> ProjectResult:
         result = ProjectResult(project_id=project_id, status="completed")
         self._interventions = 0
+        self._lessons = []
         try:
             prd = self._stage_prd(project_id, raw_idea)
             result.prd_artifact_id = f"{project_id}:PRD"
@@ -305,6 +333,13 @@ class Orchestrator:
         except BudgetExceededError as exc:
             result.status = "budget_exceeded"
             result.escalations.append(str(exc))
+
+        # Retrospective mines the finished project into the Knowledge Base.
+        if self.kb is not None and self.config.enable_retrospective:
+            try:
+                result.kb_entries_written = self._retrospective(project_id, result)
+            except (AgentOutputError, ContextOverflowError, BudgetExceededError) as exc:
+                result.escalations.append(f"retrospective skipped: {exc}")
         return self._finish(result)
 
     def _request_gate(self, gate: HumanGate, name: str, digest: str) -> GateDecision:
@@ -475,7 +510,7 @@ class Orchestrator:
             validate=validate_release, trace_ids=lambda out: [],
         )
         self.store.set_status(f"{project_id}:RELEASE", ArtifactStatus.APPROVED)
-        self.deployer.deploy(
+        self._deployments[project_id] = self.deployer.deploy(
             project_id=project_id, version=release["version"],
             environment=self.config.deploy_environment, plan=release["deploy_plan"],
         )
@@ -498,6 +533,208 @@ class Orchestrator:
         root = self.workspace_root / project_id
         cls = GitWorkspace if GitWorkspace.available() else NullGitWorkspace
         return cls(root)
+
+    # ------------------------------------------------ operate + learn (P6)
+
+    def _kb_calibration(self) -> list:
+        if self.kb is None:
+            return []
+        summary = self.kb.calibration_summary()
+        return [] if summary["samples"] == 0 else [summary]
+
+    def _kb_adrs(self) -> list:
+        return self.kb.reusable_adrs() if self.kb is not None else []
+
+    def _retrospective(self, project_id: str, result: ProjectResult) -> int:
+        """Mine the finished project into the KB (design doc §6).
+
+        Deterministic parts (calibration, failure patterns, reusable ADRs) are
+        computed here; qualitative lessons come from the Retrospective agent.
+        Returns the number of KB entries written.
+        """
+        written = 0
+        wbs_points: dict[str, int] = {}
+        try:
+            wbs = self.store.get(f"{project_id}:WBS").content
+            wbs_points = {i["id"]: i["estimate_points"] for i in wbs["wbs_items"]}
+        except ArtifactNotFoundError:
+            pass
+
+        # Estimate vs. actual calibration: a ticket that took N attempts cost
+        # ~N x its estimate. This is the signal that shrinks future error.
+        for ticket in result.tickets:
+            if ticket.status != "passed":
+                continue
+            est = wbs_points.get(self._wbs_for_ticket(project_id, ticket.ticket_id))
+            if not est:
+                continue
+            actual = est * max(1, ticket.attempts)
+            self.kb.add(
+                KIND_CALIBRATION,
+                project_id=project_id,
+                content={
+                    "story_id": ticket.story_id,
+                    "estimated_points": est,
+                    "actual_points": actual,
+                    "attempts": ticket.attempts,
+                },
+                tags=[project_id, ticket.story_id],
+            )
+            written += 1
+
+        # Failure patterns from anything that went sideways.
+        for ticket in result.tickets:
+            if ticket.status == "escalated" or ticket.security_blocks or ticket.review_blocks:
+                self.kb.add(
+                    KIND_FAILURE,
+                    project_id=project_id,
+                    content={
+                        "ticket": ticket.ticket_id,
+                        "status": ticket.status,
+                        "security_blocks": ticket.security_blocks,
+                        "review_blocks": ticket.review_blocks,
+                        "detail": ticket.detail[:300],
+                    },
+                    tags=[project_id, ticket.story_id],
+                )
+                written += 1
+
+        # Reusable ADRs from the approved architecture.
+        try:
+            architecture = self.store.get(f"{project_id}:ARCH").content
+            for adr in architecture.get("adrs", []):
+                self.kb.add(
+                    KIND_ADR, project_id=project_id, content=adr,
+                    tags=[project_id, *adr["title"].lower().split()],
+                )
+                written += 1
+        except ArtifactNotFoundError:
+            pass
+
+        # Qualitative lessons from the Retrospective agent (optional).
+        if self.retrospective_agent is not None:
+            try:
+                retro = self.retrospective_agent.run(
+                    ContextPackage(
+                        instructions=(
+                            "Write the retrospective lessons for this finished project."
+                        ),
+                        artifacts={
+                            "status": result.status,
+                            "shipped": result.shipped,
+                            "human_interventions": result.human_interventions,
+                            "tickets": [
+                                {"id": t.ticket_id, "attempts": t.attempts,
+                                 "status": t.status, "security_blocks": t.security_blocks,
+                                 "review_blocks": t.review_blocks}
+                                for t in result.tickets
+                            ],
+                            "within_project_lessons": self._lessons,
+                        },
+                    ),
+                    CostTags(project_id=project_id, stage="retrospective", agent="retrospective"),
+                )
+                for lesson in retro["lessons"]:
+                    self.kb.add(
+                        KIND_LESSON, project_id=project_id, content=lesson,
+                        tags=[project_id, lesson["category"]],
+                    )
+                    written += 1
+            except AgentOutputError as exc:
+                self._notify(project_id, STAGE_DONE, f"retrospective lessons skipped: {exc}")
+
+        self._notify(project_id, STAGE_DONE, f"retrospective wrote {written} KB entries")
+        return written
+
+    def _wbs_for_ticket(self, project_id: str, ticket_id: str) -> str | None:
+        try:
+            return self.store.get(f"{project_id}:{ticket_id}").content.get("wbs_id")
+        except ArtifactNotFoundError:
+            return None
+
+    def handle_incident(self, project_id: str, incident: ProdIncident) -> IncidentResult:
+        """Operate loop: Ops triages a prod error; an actionable one becomes a
+        fix that re-enters the dev loop, and a rollback needs human confirm
+        (design doc §3, §6). Prod feedback IS a change-request stream.
+        """
+        if self.ops is None:
+            raise ValueError("handle_incident requires an ops agent")
+        self._interventions = 0
+        result = IncidentResult(incident_id=incident.incident_id, decision="no_action")
+        try:
+            triage = self.ops.run(
+                ContextPackage(
+                    instructions=(
+                        "Triage this production incident. Decide severity, whether it is "
+                        "actionable (needs a code fix), the target user story, a fix "
+                        "summary, and whether to recommend a rollback.\n\n"
+                        f"Incident {incident.incident_id}: {incident.description}\n"
+                        f"Service: {incident.service}\nLogs:\n{incident.logs}"
+                    ),
+                    artifacts={"known_stories": self._project_story_ids(project_id)},
+                ),
+                CostTags(project_id=project_id, stage="ops", agent="ops"),
+            )
+        except AgentOutputError as exc:
+            result.decision = "escalated"
+            result.escalations.append(f"ops triage invalid: {exc}")
+            return result
+
+        result.severity = triage["severity"]
+        result.triage = triage["triage"]
+
+        if self.kb is not None:
+            self.kb.add(
+                KIND_FAILURE, project_id=project_id,
+                content={"incident": incident.incident_id, "description": incident.description,
+                         "severity": triage["severity"], "triage": triage["triage"]},
+                tags=[project_id, "incident", triage["severity"]],
+            )
+
+        # Rollback (immediate mitigation) with human confirmation.
+        if triage["recommend_rollback"] and project_id in self._deployments:
+            decision = self._request_gate(
+                self.gate, "Rollback confirmation",
+                f"Incident {incident.incident_id} ({triage['severity']}): {triage['triage']}\n"
+                "Ops recommends rolling back the current deployment.",
+            )
+            if decision.approved:
+                self.deployer.rollback(self._deployments[project_id], reason=triage["triage"])
+                result.rolled_back = True
+                self._notify(project_id, "ops", f"{incident.incident_id}: rolled back")
+
+        # Actionable -> fix ticket re-enters the dev loop via the CR machinery.
+        if triage["actionable"] and triage.get("target_story_id"):
+            cr = ChangeRequest(
+                cr_id=f"{incident.incident_id}-fix",
+                description=f"Fix for {incident.incident_id}: {triage.get('fix_summary', triage['triage'])}",
+                target_story_id=triage["target_story_id"],
+                raised_by="ops",
+            )
+            result.change_result = self.apply_change_request(project_id, cr)
+            if result.change_result.decision == "escalated":
+                result.escalations.extend(result.change_result.escalations)
+
+        if result.rolled_back and result.change_result is not None:
+            result.decision = "rolled_back+ticketed"
+        elif result.rolled_back:
+            result.decision = "rolled_back"
+        elif result.change_result is not None:
+            result.decision = "escalated" if result.escalations else "ticketed"
+        elif result.escalations:
+            result.decision = "escalated"
+        self._notify(
+            project_id, "ops",
+            f"{incident.incident_id} -> {result.decision} ({self._interventions} intervention(s))",
+        )
+        return result
+
+    def _project_story_ids(self, project_id: str) -> list[str]:
+        try:
+            prd = self.store.get(f"{project_id}:PRD").content
+            return [s["id"] for s in prd["user_stories"]]
+        except ArtifactNotFoundError:
+            return []
 
     # ---------------------------------------------------------- generic step
 
@@ -627,8 +864,7 @@ class Orchestrator:
                 ),
                 artifacts={
                     "mvp_user_stories": mvp_stories,
-                    # KB calibration data plugs in here in Phase 6
-                    "kb_calibration": [],
+                    "kb_calibration": self._kb_calibration(),
                 },
                 validate=lambda out: validate_wbs(out, mvp_ids),
                 trace_ids=lambda out: sorted(mvp_ids),
@@ -704,8 +940,7 @@ class Orchestrator:
                         {"id": item["id"], "story_id": item["story_id"], "description": item["description"]}
                         for item in planning["wbs"]["wbs_items"]
                     ],
-                    # KB ADR retrieval plugs in here in Phase 6
-                    "kb_adrs": [],
+                    "kb_adrs": self._kb_adrs(),
                 },
                 validate=lambda out: validate_architecture(out, mvp_ids),
                 trace_ids=lambda out: sorted(mvp_ids) + [adr["id"] for adr in out["adrs"]],
@@ -828,6 +1063,9 @@ class Orchestrator:
                             "ticket": ticket,
                             "workspace_files": self._list_workspace(workspace.root),
                         },
+                        # Within-project lessons buffer: what earlier tickets
+                        # tripped over, so this one avoids it (design §6).
+                        kb_entries=list(self._lessons),
                         feedback=dev_feedback,
                     ),
                     CostTags(project_id=project_id, stage=STAGE_BUILD, agent="developer", ticket_id=ticket_id),
@@ -872,6 +1110,7 @@ class Orchestrator:
                     result.security_blocks += 1
                     last_failure = security_report
                     dev_feedback = security_report
+                    self._remember_lesson(f"{ticket_id}: security blocked a change — scan before submitting")
                     self._notify(project_id, STAGE_SECURITY, f"{ticket_id} blocked by security")
                     continue
 
@@ -889,6 +1128,7 @@ class Orchestrator:
                     result.review_blocks += 1
                     last_failure = self._format_review(review)
                     dev_feedback = last_failure
+                    self._remember_lesson(f"{ticket_id}: reviewer blocked — {self._format_review(review)[:120]}")
                     self._notify(project_id, STAGE_REVIEW, f"{ticket_id} blocked by review")
                     continue
                 passed_review = review
@@ -1111,7 +1351,7 @@ class Orchestrator:
             environment=self.config.deploy_environment,
             plan=release["deploy_plan"],
         )
-        self._last_deployment = deployment
+        self._deployments[project_id] = deployment
         safe_write(
             self.workspace_root / project_id,
             "CHANGELOG.md",
@@ -1243,12 +1483,19 @@ class Orchestrator:
             lines.append(f"- [{c['severity']}] {c['path']}: {c['comment']}")
         return "\n".join(lines)
 
+    def _remember_lesson(self, lesson: str) -> None:
+        """Append to the within-project lessons buffer (deduped, capped)."""
+        if lesson not in self._lessons:
+            self._lessons.append(lesson)
+            del self._lessons[:-20]  # keep the buffer bounded
+
     def _escalate_ticket(self, project_id, workspace, pr, result: TicketResult, detail) -> TicketResult:
         workspace.abandon_ticket_branch(result.branch)
         self.pr_publisher.close_pr(pr, f"escalated after {result.attempts} attempt(s)")
         result.status = "escalated"
         result.detail = detail
         self._interventions += 1  # a human now owns this ticket
+        self._remember_lesson(f"{result.ticket_id} escalated: {detail[:120]}")
         self._notify(
             project_id,
             STAGE_BUILD,
@@ -1387,6 +1634,7 @@ class Orchestrator:
             f"security findings {result.security_findings_total} "
             f"({result.security_blocks_total} blocking); "
             f"human interventions {result.human_interventions}; "
+            f"KB entries written {result.kb_entries_written}; "
             f"first-try validation rate {rate}; "
             f"total cost ${result.total_cost_usd:.4f}; "
             f"per stage: {self.ledger.summary(result.project_id)}",

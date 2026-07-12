@@ -36,3 +36,5 @@ class OrchestratorConfig:
     deploy_environment: str = "production"
     # Phase 5 change management
     cr_gate_threshold_points: int = 5  # a change delta above this goes to a human gate
+    # Phase 6 operate + learn
+    enable_retrospective: bool = True  # write KB entries at project close (needs a KB)

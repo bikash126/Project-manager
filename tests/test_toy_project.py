@@ -31,6 +31,16 @@ def test_toy_project_change_request_reruns_blast_radius_only(tmp_path, capsys):
     assert "new version: 0.1.1" in out
 
 
+def test_toy_project_incident_reenters_dev_loop(tmp_path, capsys):
+    assert main(
+        ["--workspace", str(tmp_path), "--gate", "auto", "--sandbox", "local", "--incident"]
+    ) == 0
+    out = capsys.readouterr().out
+    assert "KB entries written by retrospective:" in out  # P6: retrospective -> KB
+    assert "decision: ticketed" in out
+    assert "fix re-entered the dev loop -> tickets ['TCK-001']" in out
+
+
 def test_toy_project_security_gate_catches_planted_secret(tmp_path, capsys):
     assert main(
         ["--workspace", str(tmp_path), "--gate", "auto", "--sandbox", "local", "--inject-secret"]

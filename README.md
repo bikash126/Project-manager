@@ -1,13 +1,66 @@
-# Multi-Agent Software Development PM System — Phases 1–3
+# Multi-Agent Software Development PM System — Phases 1–6
 
-Phases 1–3 of the [design document](https://app.notion.com/p/39ad619bbee38114b98cff069085958a):
-a PM Orchestrator plus nine specialist agents that take a raw project idea
-through the upstream pipeline — PRD → prioritized backlog/MVP → WBS +
-estimates → sprint plan → **Gate 1** → architecture/ADRs → **Gate 2** — and
-then through the per-ticket quality loop `Dev → Security → Review → QA`, each
-ticket a PR, on a toy project, with the foundations the design says must exist
-from day one: versioned artifact store with a status lifecycle, cost ledger,
-sandbox platform, and the agent eval harness.
+Phases 1–6 of the [design document](https://app.notion.com/p/39ad619bbee38114b98cff069085958a):
+a PM Orchestrator plus fifteen specialist agents that take a raw project idea
+through the full lifecycle — PRD → backlog/MVP → WBS + estimates → sprint plan
+→ **Gate 1** → architecture/ADRs → **Gate 2** → the per-ticket quality loop
+`Dev → Security → Review → QA` (each ticket a PR) → the ship path (integration
++ license check → migrations → CI/CD → **Gate 3** → release/deploy → docs) —
+then operates and learns: change requests re-run only their blast radius, prod
+incidents re-enter the dev loop, and a retrospective feeds a Knowledge Base
+that calibrates future estimates. Runs end-to-end on a toy project, on the
+foundations the design requires from day one: a versioned artifact store with a
+status lifecycle, cost ledger, sandbox platform, traceability index, and the
+agent eval harness.
+
+## What's implemented — Phase 6 (operate + learn)
+
+| Design element | Where | Notes |
+|---|---|---|
+| Ops/SRE agent | `pm_system/agents/ops.py` | Triages a prod incident: severity, actionable?, target story + fix, rollback? |
+| Operate loop | `Orchestrator.handle_incident` | An actionable incident becomes a fix that **re-enters the dev loop** via the CR machinery; prod feedback is a change-request stream |
+| Rollback with human confirm | `handle_incident` + `deploy.py` | Ops recommends; a gate confirms; only then `Deployer.rollback` runs (credential scoping) |
+| Knowledge Base | `pm_system/kb/store.py` | Cross-project memory: calibration, reusable ADRs, failure patterns, lessons; hybrid keyword/tag retrieval |
+| Retrospective | `Orchestrator._retrospective` (+ `RetrospectiveAgent`) | At project close writes estimate-vs-actual calibration, failure patterns, ADRs, and qualitative lessons to the KB |
+| KB read at task start | Estimator `kb_calibration`, Architect `kb_adrs` | The Phase-2 placeholders are now fed from the KB |
+| Within-project lessons buffer | `Orchestrator._remember_lesson` | Blocks/escalations accumulate lessons passed to later tickets' context |
+| P6 metric | `KnowledgeBase.calibration_factor` | Estimate error shrinks across projects: the learned factor corrects new estimates (`tests/test_kb.py`) |
+| P3/P6 playbooks | `playbooks/{ops,retrospective}.md` | Triage taxonomy; retrospective lesson format |
+
+**Phase 6 exit criteria:** a prod error is auto-triaged into a ticket that
+re-enters the dev loop (`--incident`; `tests/test_phase6_operate.py`), and the
+retrospective writes structured KB entries at project close (calibration + ADRs
++ lessons, reported as `kb_entries_written`).
+
+## What's implemented — Phase 5 (change management)
+
+| Design element | Where | Notes |
+|---|---|---|
+| CR flow | `Orchestrator.apply_change_request` | Triage → impact analysis → re-estimate → gate-if-large → stale invalidation → re-run only the blast radius |
+| Product Owner triage | `Agent.run(schema=…)` + `change.py` | Accept / defer / reject, via a per-call schema override so one agent does both backlog and CR triage |
+| Impact analysis | traceability index | A CR targeting a story pins its ticket + code + QA + review + PRD + docs; planning artifacts and other tickets are untouched |
+| Re-estimate + gate | `cr_gate_threshold_points` | A delta above the threshold goes to a human gate that can reject the change |
+| `stale` invalidation | `ArtifactStore.mark_stale` | Affected artifacts flip to `stale` before re-run; the PRD is amended into a new version |
+| Blast-radius metric | `ChangeResult.blast_radius_ratio` | Measured, not full re-run — the toy CR re-runs 7/17 artifacts |
+
+**Phase 5 exit criteria:** a CR is handled by re-running only the affected
+artifacts — `--change-request` amends US-001 and reports a 41% blast radius
+with all planning artifacts and the other ticket untouched
+(`tests/test_phase5_change.py`).
+
+## What's implemented — Phase 4 (ship path)
+
+| Design element | Where | Notes |
+|---|---|---|
+| DevOps / Release Manager / Doc Writer / Data Engineer | `pm_system/agents/` | CI/CD + IaC; version + changelog + deploy/rollback; README/API docs; reversible migrations |
+| Ship path | `Orchestrator._ship` | integration + license check → migrations (if a data model) → DevOps → Release → **Gate 3** → deploy → Docs; a broken build is never shipped |
+| License compliance | `pm_system/security/licenses.py` | Blocks denylisted copyleft deps; warns on unknown; greenfield checks clean |
+| Deploy/rollback | `pm_system/orchestrator/deploy.py` | `Deployer` (Null default); only the Release Manager deploys (credential scoping) |
+| P4 metric | `ProjectResult.human_interventions` | Gate interactions + escalations; the toy ships with 3 (the gates) |
+
+**Phase 4 exit criterion:** a greenfield project ships end-to-end with ≤ N
+human interventions — the toy ships `0.1.0` with 3 (`python -m
+examples.run_toy_project`; `tests/test_phase4_ship.py`).
 
 ## What's implemented — Phase 3 (quality + security loop)
 
@@ -72,12 +125,10 @@ eval suites exist for all four Phase-2 agents (`pm_system/evals/golden.py`).
 | P0 playbooks | `playbooks/{analyst,developer,qa}.md` | Role definition, procedure, template, checklist, failure patterns, escalation rules |
 | Model tiering | `pm_system/config.py`, `pm_system/llm/client.py` | Strong/mid/cheap tiers, per-family pricing for the ledger |
 
-Deliberately **not** built yet (later phases per the build plan): ship path —
-DevOps/Release/Docs/Data Engineer + Gate 3 (Phase 4), change management /
-`stale` propagation (5), Knowledge Base + retrospectives (6), UX/UI + parallel
-dev (7). The hooks they need already exist: `kb_calibration`/`kb_adrs` inputs,
-the `stale` status, the traceability index, and Gate 3 is one more
-`HumanGate`.
+Deliberately **not** built yet: **Phase 7 — hardening** (UX/UI agents,
+parallel dev agents + merge-conflict handling, observability dashboards,
+stakeholder digests, multi-project concurrency). Everything through Phase 6 is
+implemented.
 
 ## Exit criteria
 
@@ -92,14 +143,23 @@ the `stale` status, the traceability index, and Gate 3 is one more
 - **P3 — PRs pass Review+QA within 3 retries (≥ 70%), security findings caught
   pre-review** — reported as `pr_pass_rate`; the `--inject-secret` run shows
   the Security gate blocking before Review.
+- **P4 — greenfield project shipped with ≤ N human interventions** — the toy
+  ships `0.1.0` with 3 (the gates); `shipped`/`human_interventions`.
+- **P5 — CR handled with only affected artifacts re-run** — `blast_radius_ratio`
+  (41% on the toy CR).
+- **P6 — prod error auto-triaged into a ticket that re-enters the dev loop;
+  retrospective writes KB entries; estimate error shrinks across projects** —
+  `--incident`, `kb_entries_written`, `calibration_factor`.
 
 ## Quickstart
 
 ```bash
 pip install -e ".[dev]"          # + [llm] for Anthropic, + [slack] for Slack
-python -m pytest                 # 108 tests
-python -m examples.run_toy_project --sandbox local   # offline, scripted LLM
-python -m examples.run_toy_project --sandbox local --inject-secret  # security gate demo
+python -m pytest                 # 139 tests
+python -m examples.run_toy_project --sandbox local                  # full lifecycle, offline
+python -m examples.run_toy_project --sandbox local --inject-secret  # P3 security gate demo
+python -m examples.run_toy_project --sandbox local --change-request # P5 blast-radius demo
+python -m examples.run_toy_project --sandbox local --incident       # P6 operate-loop demo
 
 # eval the planning/review/security agents against real models (gates prompt changes)
 ANTHROPIC_API_KEY=... python -m pm_system.evals.run --role reviewer --role security
@@ -111,10 +171,12 @@ and executes in the sandbox. To run against real models, build the agents with
 
 ```python
 from pm_system import (AnalystAgent, AnthropicLLM, ArchitectAgent, ArtifactStore,
-                       CostLedger, DeveloperAgent, EstimatorAgent, GitHubPRPublisher,
-                       MeteredLLM, Orchestrator, PlannerAgent, ProductOwnerAgent,
-                       QAAgent, ReviewerAgent, SecurityAgent, SlackGate, default_sandbox)
-from pm_system.config import MID_MODEL, STRONG_MODEL
+                       CostLedger, DataEngineerAgent, DeveloperAgent, DevOpsAgent,
+                       DocWriterAgent, EstimatorAgent, GitHubPRPublisher, KnowledgeBase,
+                       MeteredLLM, OpsAgent, Orchestrator, PlannerAgent, ProdIncident,
+                       ProductOwnerAgent, QAAgent, ReleaseManagerAgent, RetrospectiveAgent,
+                       ReviewerAgent, SecurityAgent, SlackGate, default_sandbox)
+from pm_system.config import CHEAP_MODEL, MID_MODEL, STRONG_MODEL
 
 ledger = CostLedger("costs.db", stage_budgets={"intake": 5, "build": 20, "qa": 10})
 store = ArtifactStore("artifacts.db")
@@ -131,12 +193,22 @@ orchestrator = Orchestrator(
     reviewer=ReviewerAgent(llm(), model=STRONG_MODEL),   # separate instance (D3)
     security=SecurityAgent(llm(), model=STRONG_MODEL),   # separate instance (D3)
     qa=QAAgent(llm(), model=STRONG_MODEL),
+    # ship path (Phase 4) + operate/learn (Phase 6)
+    data_engineer=DataEngineerAgent(llm(), model=MID_MODEL),
+    devops=DevOpsAgent(llm(), model=MID_MODEL),
+    release_manager=ReleaseManagerAgent(llm(), model=CHEAP_MODEL),
+    doc_writer=DocWriterAgent(llm(), model=CHEAP_MODEL),
+    ops=OpsAgent(llm(), model=MID_MODEL),
+    retrospective_agent=RetrospectiveAgent(llm(), model=CHEAP_MODEL),
+    kb=KnowledgeBase("kb.db"),
     gate=SlackGate(token="xoxb-...", channel="#pm-gates"),
     pr_publisher=GitHubPRPublisher(owner="acme", repo="widget", token="ghp_..."),
     sandbox=default_sandbox(), workspace_root=Path("workspaces"),
 )
 result = orchestrator.run_project("my-project", "Build a ...",
                                   constraints="budget covers ~2/3 of scope")
+# later: a production incident re-enters the dev loop
+outcome = orchestrator.handle_incident("my-project", ProdIncident("INC-1", "500s on save"))
 ```
 
 ### Sandbox
@@ -163,21 +235,25 @@ internal networks have no external route.
 
 ```
 pm_system/
-  orchestrator/   state machine, handoff validation, git workspace, PR publisher
-  agents/         base + analyst/PO/estimator/planner/architect/developer/reviewer/security/qa
+  orchestrator/   state machine, validation, git workspace, PR publisher, deploy,
+                  change requests (CR flow), incidents (operate loop)
+  agents/         base + the 15 roles (analyst, PO, estimator, planner, architect,
+                  developer, reviewer, security, qa, data_engineer, devops,
+                  release_manager, doc_writer, ops, retrospective)
   artifacts/      versioned store with status lifecycle + traceability index
   costs/          cost ledger + budget caps
   llm/            Anthropic/mock clients, metering, pricing
   sandbox/        Docker/local runners, egress policy + proxy, test runner
-  security/       deterministic scanners (SAST/secrets/deps) + severity model
+  security/       deterministic scanners (SAST/secrets/deps) + license compliance
+  kb/             Knowledge Base: calibration, ADRs, failure patterns, lessons
   gates/          Slack/console/auto human gates
   notify/         stage-transition digests (console/Slack)
   evals/          eval harness, golden suites, real-model runner
-playbooks/        analyst, developer, qa, architect, estimator, planner, product_owner, reviewer, security
+playbooks/        one per role (15)
 standards/        coding_standards.md (KB standards doc for the Reviewer)
 sandbox/          Dockerfile for the task image (+ security stack)
 examples/         toy project runner + scripted mock responses
-tests/            unit + end-to-end suite
+tests/            unit + end-to-end suite (139 tests)
 ```
 
 Storage is SQLite behind Postgres-shaped interfaces; swapping the backend
