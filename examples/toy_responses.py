@@ -447,3 +447,20 @@ QA_RESPONSES = [QA_TICKET_1, QA_TICKET_2]
 DEVOPS_RESPONSES = [DEVOPS]
 RELEASE_RESPONSES = [RELEASE]
 DOCS_RESPONSES = [DOCS]
+
+# Change-request demo fixtures (Phase 5): amend US-001's acceptance criteria.
+CR_TRIAGE_ACCEPT = _fenced(
+    {"decision": "accept", "reason": "small, high-value clarification of the conversion"}
+)
+RELEASE_PATCH = _fenced(
+    {
+        "version": "0.1.1",
+        "changelog": [{"type": "changed", "description": "clarified conversion rounding"}],
+        "deploy_plan": "tag 0.1.1 and promote staging -> production",
+        "rollback_plan": "revert to 0.1.0; no migrations to undo",
+    }
+)
+CR_NEW_ACCEPTANCE_CRITERIA = [
+    {"id": "AC-001", "given": "100 Celsius", "when": "converting to Fahrenheit", "then": "212"},
+    {"id": "AC-002", "given": "37 Celsius", "when": "converting to Fahrenheit", "then": "98.6"},
+]

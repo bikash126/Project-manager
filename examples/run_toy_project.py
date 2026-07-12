@@ -18,17 +18,23 @@ from pathlib import Path
 from examples.toy_responses import (
     ANALYST_RESPONSES,
     ARCHITECT_RESPONSES,
+    CR_NEW_ACCEPTANCE_CRITERIA,
+    CR_TRIAGE_ACCEPT,
     DEV_TICKET_1,
     DEV_TICKET_1_INSECURE,
     DEV_TICKET_2,
     DEVELOPER_RESPONSES,
     DEVOPS_RESPONSES,
+    DOCS,
     DOCS_RESPONSES,
     ESTIMATOR_RESPONSES,
     PLANNER_RESPONSES,
     PRODUCT_OWNER_RESPONSES,
     QA_RESPONSES,
+    QA_TICKET_1,
+    RELEASE_PATCH,
     RELEASE_RESPONSES,
+    REVIEW_TICKET_1,
     REVIEWER_RESPONSES,
     SECURITY_CONFIRM,
 )
@@ -37,6 +43,7 @@ from pm_system import (
     ArchitectAgent,
     ArtifactStore,
     AutoApproveGate,
+    ChangeRequest,
     ConsoleGate,
     ConsoleNotifier,
     CostLedger,
@@ -76,6 +83,12 @@ def main(argv=None) -> int:
         help="developer hardcodes a secret on the first TCK-001 attempt; the "
         "Security gate should catch it pre-review, block, and pass on retry",
     )
+    parser.add_argument(
+        "--change-request",
+        action="store_true",
+        help="after shipping, raise a CR that amends US-001 and show that only "
+        "the blast radius re-runs (Phase 5)",
+    )
     args = parser.parse_args(argv)
 
     workspace_root = args.workspace or Path(tempfile.mkdtemp(prefix="pm-toy-"))
@@ -94,26 +107,41 @@ def main(argv=None) -> int:
     def metered(responses):
         return MeteredLLM(MockLLM(responses), ledger)
 
-    analyst = AnalystAgent(metered(ANALYST_RESPONSES), model=STRONG_MODEL)
-    product_owner = ProductOwnerAgent(metered(PRODUCT_OWNER_RESPONSES), model=STRONG_MODEL)
-    estimator = EstimatorAgent(metered(ESTIMATOR_RESPONSES), model=MID_MODEL)
-    planner = PlannerAgent(metered(PLANNER_RESPONSES), model=MID_MODEL)
-    architect = ArchitectAgent(metered(ARCHITECT_RESPONSES), model=STRONG_MODEL)
+    # Per-role response queues, extended for the optional demos.
     if args.inject_secret:
         dev_responses = [DEV_TICKET_1_INSECURE, DEV_TICKET_1, DEV_TICKET_2]
         security_responses = [SECURITY_CONFIRM]  # confirms the planted key -> block
     else:
-        dev_responses = DEVELOPER_RESPONSES
+        dev_responses = list(DEVELOPER_RESPONSES)
         security_responses = []  # clean code -> scanners find nothing -> agent unused
 
+    po_responses = list(PRODUCT_OWNER_RESPONSES)
+    reviewer_responses = list(REVIEWER_RESPONSES)
+    qa_responses = list(QA_RESPONSES)
+    release_responses = list(RELEASE_RESPONSES)
+    docs_responses = list(DOCS_RESPONSES)
+    if args.change_request:
+        # extra responses to re-run TCK-001 and re-ship a patch after the CR
+        po_responses += [CR_TRIAGE_ACCEPT]
+        dev_responses += [DEV_TICKET_1]
+        reviewer_responses += [REVIEW_TICKET_1]
+        qa_responses += [QA_TICKET_1]
+        release_responses += [RELEASE_PATCH]
+        docs_responses += [DOCS]
+
+    analyst = AnalystAgent(metered(ANALYST_RESPONSES), model=STRONG_MODEL)
+    product_owner = ProductOwnerAgent(metered(po_responses), model=STRONG_MODEL)
+    estimator = EstimatorAgent(metered(ESTIMATOR_RESPONSES), model=MID_MODEL)
+    planner = PlannerAgent(metered(PLANNER_RESPONSES), model=MID_MODEL)
+    architect = ArchitectAgent(metered(ARCHITECT_RESPONSES), model=STRONG_MODEL)
     developer = DeveloperAgent(metered(dev_responses), model=STRONG_MODEL)
-    reviewer = ReviewerAgent(metered(REVIEWER_RESPONSES), model=STRONG_MODEL)
+    reviewer = ReviewerAgent(metered(reviewer_responses), model=STRONG_MODEL)
     security = SecurityAgent(metered(security_responses), model=STRONG_MODEL)
-    qa = QAAgent(metered(QA_RESPONSES), model=STRONG_MODEL)
+    qa = QAAgent(metered(qa_responses), model=STRONG_MODEL)
     data_engineer = DataEngineerAgent(metered([]), model=MID_MODEL)  # no data model in toy
     devops = DevOpsAgent(metered(DEVOPS_RESPONSES), model=MID_MODEL)
-    release_manager = ReleaseManagerAgent(metered(RELEASE_RESPONSES), model=CHEAP_MODEL)
-    doc_writer = DocWriterAgent(metered(DOCS_RESPONSES), model=CHEAP_MODEL)
+    release_manager = ReleaseManagerAgent(metered(release_responses), model=CHEAP_MODEL)
+    doc_writer = DocWriterAgent(metered(docs_responses), model=CHEAP_MODEL)
 
     if args.sandbox == "local":
         sandbox = LocalSandbox()
@@ -180,6 +208,31 @@ def main(argv=None) -> int:
     print("\n=== Traceability: what depends on US-001? ===")
     for artifact in store.find_by_trace("toy-temp-converter", "US-001"):
         print(f"  {artifact.artifact_id} ({artifact.artifact_type})")
+
+    if args.change_request and result.shipped:
+        cr = ChangeRequest(
+            cr_id="CR-001",
+            description="Amend US-001 to specify body-temperature conversion (37C -> 98.6F)",
+            target_story_id="US-001",
+            new_acceptance_criteria=CR_NEW_ACCEPTANCE_CRITERIA,
+        )
+        change = orchestrator.apply_change_request("toy-temp-converter", cr)
+        print("\n=== Change request CR-001 ===")
+        print(f"decision: {change.decision}")
+        print(
+            f"blast radius: {len(change.blast_radius)}/{change.total_artifacts} artifacts "
+            f"({'n/a' if change.blast_radius_ratio is None else f'{change.blast_radius_ratio:.0%}'}"
+            "  [P5 exit: only affected artifacts re-run])"
+        )
+        print(f"  re-run: {sorted(change.blast_radius)}")
+        print(f"  re-run tickets: {[t.ticket_id for t in change.rerun_tickets]}")
+        print(f"new version: {change.new_version}")
+        untouched = [
+            a.artifact_id for a in store.list_project("toy-temp-converter")
+            if a.artifact_id not in change.blast_radius
+        ]
+        print(f"  untouched ({len(untouched)}): {sorted(untouched)}")
+
     return 0 if result.status == "completed" else 1
 
 

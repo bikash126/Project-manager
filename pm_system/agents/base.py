@@ -53,8 +53,12 @@ class Agent:
         path = playbook_path or PLAYBOOK_DIR / f"{self.role}.md"
         self.playbook = path.read_text() if path.exists() else ""
 
-    def run(self, context: ContextPackage, tags: CostTags) -> dict:
-        system = self.system_prompt()
+    def run(self, context: ContextPackage, tags: CostTags, *, schema: dict | None = None) -> dict:
+        """Run the agent. ``schema`` overrides the role's default output schema
+        for one call — used when an agent has a secondary task (e.g. the Product
+        Owner triaging a change request)."""
+        schema = schema or self.output_schema
+        system = self.system_prompt(schema)
         prompt = self.user_prompt(context)
         total = len(system) + len(prompt)
         if total > self.max_context_chars:
@@ -73,13 +77,14 @@ class Agent:
         except (ValueError, json.JSONDecodeError) as exc:
             raise AgentOutputError([f"output is not valid JSON: {exc}"]) from exc
         try:
-            jsonschema.validate(data, self.output_schema)
+            jsonschema.validate(data, schema)
         except jsonschema.ValidationError as exc:
             location = "/".join(str(p) for p in exc.absolute_path) or "(root)"
             raise AgentOutputError([f"schema violation at {location}: {exc.message}"]) from exc
         return data
 
-    def system_prompt(self) -> str:
+    def system_prompt(self, schema: dict | None = None) -> str:
+        schema = schema or self.output_schema
         parts = [f"You are the {self.role} agent in a multi-agent software delivery system."]
         if self.playbook:
             parts.append(f"# Your playbook\n\n{self.playbook}")
@@ -87,7 +92,7 @@ class Agent:
             "# Output contract\n\n"
             "Respond with exactly one JSON object (optionally inside a ```json fence) "
             "matching this JSON Schema. No prose outside the JSON.\n\n"
-            f"```json\n{json.dumps(self.output_schema, indent=2)}\n```"
+            f"```json\n{json.dumps(schema, indent=2)}\n```"
         )
         return "\n\n".join(parts)
 

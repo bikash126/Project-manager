@@ -23,6 +23,7 @@ from pm_system.evals.harness import EvalCase, EvalHarness, EvalReport
 from pm_system.gates.gate import AutoApproveGate, ConsoleGate, GateDecision, HumanGate, SlackGate
 from pm_system.llm.client import AnthropicLLM, CostTags, MeteredLLM, MockLLM
 from pm_system.notify.notifier import ConsoleNotifier, Notifier, SlackNotifier
+from pm_system.orchestrator.change import ChangeRequest, ChangeResult
 from pm_system.orchestrator.deploy import Deployer, NullDeployer
 from pm_system.orchestrator.orchestrator import Orchestrator, ProjectResult, TicketResult
 from pm_system.orchestrator.pr import (
@@ -61,6 +62,8 @@ __all__ = [
     "CostLedger",
     "CostTags",
     "ContextPackage",
+    "ChangeRequest",
+    "ChangeResult",
     "DataEngineerAgent",
     "Deployer",
     "DeveloperAgent",

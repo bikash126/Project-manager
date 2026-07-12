@@ -34,3 +34,5 @@ class OrchestratorConfig:
     enable_ship: bool = True  # run the ship path after the build loop
     gate3_enabled: bool = True  # human gate on release (D4)
     deploy_environment: str = "production"
+    # Phase 5 change management
+    cr_gate_threshold_points: int = 5  # a change delta above this goes to a human gate

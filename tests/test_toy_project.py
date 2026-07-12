@@ -21,6 +21,16 @@ def test_toy_project_end_to_end(tmp_path, capsys):
     assert (tmp_path / "toy-temp-converter" / "README.md").exists()
 
 
+def test_toy_project_change_request_reruns_blast_radius_only(tmp_path, capsys):
+    assert main(
+        ["--workspace", str(tmp_path), "--gate", "auto", "--sandbox", "local", "--change-request"]
+    ) == 0
+    out = capsys.readouterr().out
+    assert "decision: accepted" in out
+    assert "re-run tickets: ['TCK-001']" in out  # only the affected ticket
+    assert "new version: 0.1.1" in out
+
+
 def test_toy_project_security_gate_catches_planted_secret(tmp_path, capsys):
     assert main(
         ["--workspace", str(tmp_path), "--gate", "auto", "--sandbox", "local", "--inject-secret"]

@@ -27,6 +27,10 @@ Security runs before Review (exit criterion: findings caught pre-review) and
 its verdict is block/pass (D7). Each ticket is a PR. A broken build (any
 escalated ticket) is never shipped.
 
+Change requests (Phase 5, apply_change_request) reuse the same machinery:
+Product Owner triages, traceability IDs pin the blast radius, a large delta
+goes to a gate, affected artifacts flip to `stale`, and only those re-run.
+
 The orchestrator never writes code, designs, or docs itself; it curates
 context packages, validates outputs, enforces gates/retries/budgets/context
 caps, and emits a status digest on every stage transition.
@@ -57,6 +61,7 @@ from pm_system.config import OrchestratorConfig
 from pm_system.costs.ledger import CostLedger
 from pm_system.errors import (
     AgentOutputError,
+    ArtifactNotFoundError,
     BudgetExceededError,
     ContextOverflowError,
     EscalationError,
@@ -64,6 +69,7 @@ from pm_system.errors import (
 from pm_system.gates.gate import GateDecision, HumanGate
 from pm_system.llm.client import CostTags
 from pm_system.notify.notifier import ConsoleNotifier, Notifier
+from pm_system.orchestrator.change import CR_TRIAGE_SCHEMA, ChangeRequest, ChangeResult
 from pm_system.orchestrator.deploy import Deployer, NullDeployer
 from pm_system.orchestrator.git_workspace import GitWorkspace, NullGitWorkspace
 from pm_system.orchestrator.pr import NullPRPublisher, PRPublisher, Verdict
@@ -259,14 +265,12 @@ class Orchestrator:
         path = standards_path or DEFAULT_STANDARDS_PATH
         self.standards = path.read_text() if path.exists() else ""
         self.tracker = ValidationTracker()
-        self._versions: dict[str, int] = {}
         self._interventions = 0
 
     # ------------------------------------------------------------------ api
 
     def run_project(self, project_id: str, raw_idea: str, constraints: str = "") -> ProjectResult:
         result = ProjectResult(project_id=project_id, status="completed")
-        self._versions = {}
         self._interventions = 0
         try:
             prd = self._stage_prd(project_id, raw_idea)
@@ -308,6 +312,193 @@ class Orchestrator:
         self._interventions += 1
         return gate.request_approval(name, digest)
 
+    # ------------------------------------------------ change management (P5)
+
+    def apply_change_request(self, project_id: str, cr: ChangeRequest) -> ChangeResult:
+        """Handle a CR mid/post-flight: triage -> impact analysis -> re-estimate
+        -> stale invalidation -> re-run only the blast radius (design doc §3).
+
+        The whole point is a small blast radius: traceability IDs pin down
+        exactly which artifacts a change touches, so only those re-run.
+        """
+        self._interventions = 0
+        result = ChangeResult(cr_id=cr.cr_id, decision="accepted")
+        latest = self.store.list_project(project_id)
+        result.total_artifacts = len(latest)
+        prd = self.store.get(f"{project_id}:PRD").content
+
+        # 1. Product Owner triage: accept / defer / reject
+        try:
+            triage = self.product_owner.run(
+                ContextPackage(
+                    instructions=(
+                        "Triage this change request against the product. Decide accept, "
+                        "defer, or reject, with a reason.\n\n"
+                        f"Change request {cr.cr_id}: {cr.description}\n"
+                        f"Target story: {cr.target_story_id}"
+                    ),
+                    artifacts={"user_stories": prd["user_stories"]},
+                ),
+                CostTags(project_id=project_id, stage="change", agent="product_owner"),
+                schema=CR_TRIAGE_SCHEMA,
+            )
+        except AgentOutputError as exc:
+            result.decision = "escalated"
+            result.escalations.append(f"CR triage invalid: {exc}")
+            return result
+        result.reason = triage["reason"]
+        if triage["decision"] != "accept":
+            result.decision = "deferred" if triage["decision"] == "defer" else "rejected"
+            self._notify(project_id, "change", f"{cr.cr_id} {result.decision}: {triage['reason']}")
+            return result
+
+        # 2. Impact analysis via traceability IDs
+        affected_tickets = [
+            a for a in latest
+            if a.artifact_type == "ticket" and cr.target_story_id in a.trace_ids
+        ]
+        if not affected_tickets:
+            result.decision = "escalated"
+            result.escalations.append(
+                f"CR targets {cr.target_story_id}, which has no ticket in {project_id}"
+            )
+            return result
+
+        existing_ids = {a.artifact_id for a in latest}
+        blast: list[str] = [f"{project_id}:PRD"]
+        for tk in affected_tickets:
+            tid = tk.content["ticket_id"]
+            blast.append(tk.artifact_id)
+            for prefix in ("CODE", "QA", "REVIEW"):
+                aid = f"{project_id}:{prefix}-{tid}"
+                if aid in existing_ids:
+                    blast.append(aid)
+        was_shipped = f"{project_id}:RELEASE" in existing_ids
+        if was_shipped:
+            blast += [f"{project_id}:DOCS", f"{project_id}:RELEASE"]
+        result.blast_radius = blast
+
+        # 3. Re-estimate the delta (work to redo) and gate if it is large
+        wbs = self.store.get(f"{project_id}:WBS").content
+        points = {item["id"]: item["estimate_points"] for item in wbs["wbs_items"]}
+        result.delta_points = sum(points.get(tk.content["wbs_id"], 0) for tk in affected_tickets)
+        if result.delta_points > self.config.cr_gate_threshold_points:
+            decision = self._request_gate(
+                self.gate, "Gate 1 — change budget",
+                f"CR {cr.cr_id}: {cr.description}\nDelta ~{result.delta_points} points; "
+                f"blast radius {len(blast)}/{result.total_artifacts} artifacts.",
+            )
+            if not decision.approved:
+                result.decision = "rejected"
+                result.reason = f"change budget gate rejected: {decision.comments}"
+                return result
+
+        # 4. Apply the change to the PRD (new version) and flip affected to stale
+        if cr.new_acceptance_criteria is not None:
+            new_stories = []
+            for story in prd["user_stories"]:
+                if story["id"] == cr.target_story_id:
+                    story = {**story, "acceptance_criteria": cr.new_acceptance_criteria}
+                new_stories.append(story)
+            self._upsert(
+                f"{project_id}:PRD",
+                artifact_type="prd",
+                content={**prd, "user_stories": new_stories},
+                created_by="analyst",
+                project_id=project_id,
+                trace_ids=[s["id"] for s in new_stories],
+            )
+        for aid in blast:
+            artifact = self.store.get(aid)
+            if artifact.status == ArtifactStatus.APPROVED:
+                self.store.mark_stale(aid)
+
+        # 5. Re-run only the affected tickets (the blast radius)
+        prd = self.store.get(f"{project_id}:PRD").content
+        stories = {s["id"]: s for s in prd["user_stories"]}
+        wbs_items = {item["id"]: item for item in wbs["wbs_items"]}
+        architecture = self.store.get(f"{project_id}:ARCH").content
+        workspace = self._open_workspace(project_id)
+        for tk in affected_tickets:
+            content = tk.content
+            ticket = self._ticket_dict(
+                content["ticket_id"], wbs_items[content["wbs_id"]],
+                stories[content["story_id"]], architecture,
+            )
+            self._upsert(
+                tk.artifact_id, artifact_type="ticket", content=ticket,
+                created_by="orchestrator", project_id=project_id,
+                trace_ids=[content["wbs_id"], content["story_id"]],
+            )
+            self._notify(project_id, "change", f"re-running {ticket['ticket_id']} for {cr.cr_id}")
+            ticket_result = self._run_ticket(project_id, workspace, ticket)
+            result.rerun_tickets.append(ticket_result)
+            if ticket_result.status == "escalated":
+                result.decision = "escalated"
+                result.escalations.append(f"{ticket_result.ticket_id} escalated during CR")
+
+        # 6. Re-ship: patch release + refreshed docs (only if it shipped before)
+        if result.decision == "accepted" and was_shipped and self.config.enable_ship:
+            try:
+                self._reship(project_id, prd, result)
+            except EscalationError as exc:
+                result.decision = "escalated"
+                result.escalations.append(str(exc))
+
+        self._notify(
+            project_id, "change",
+            f"{cr.cr_id} {result.decision}; blast radius "
+            f"{len(result.blast_radius)}/{result.total_artifacts} artifacts; "
+            f"{self._interventions} intervention(s)",
+        )
+        return result
+
+    def _reship(self, project_id, prd, result: ChangeResult) -> None:
+        """Cut a patch release and refresh docs after an accepted change."""
+        workspace = self._open_workspace(project_id)
+        integration = self.test_runner.run(workspace.root)
+        if not integration.passed:
+            raise EscalationError("integration tests failed after the change")
+        prev = self.store.get(f"{project_id}:RELEASE").content["version"]
+        major, minor, patch = (int(p) for p in prev.split("."))
+        bumped = f"{major}.{minor}.{patch + 1}"
+        story_summary = [{"id": s["id"], "story": s["story"]} for s in prd["user_stories"]]
+        release = self._produce(
+            project_id=project_id, kind="release", stage=STAGE_RELEASE,
+            agent=self.release_manager, artifact_id=f"{project_id}:RELEASE",
+            artifact_type="release",
+            instructions=(
+                f"Cut a patch release (previous was {prev}; use {bumped}) covering the "
+                "accepted change. Provide changelog, deploy plan, and rollback plan."
+            ),
+            artifacts={"project": prd["title"], "stories": story_summary, "previous_version": prev},
+            validate=validate_release, trace_ids=lambda out: [],
+        )
+        self.store.set_status(f"{project_id}:RELEASE", ArtifactStatus.APPROVED)
+        self.deployer.deploy(
+            project_id=project_id, version=release["version"],
+            environment=self.config.deploy_environment, plan=release["deploy_plan"],
+        )
+        docs = self._produce(
+            project_id=project_id, kind="docs", stage=STAGE_DOCS, agent=self.doc_writer,
+            artifact_id=f"{project_id}:DOCS", artifact_type="docs",
+            instructions="Refresh the docs for the changed behavior. Include a README.",
+            artifacts={"prd": {"title": prd["title"], "summary": prd["summary"],
+                               "user_stories": story_summary}, "version": release["version"]},
+            validate=validate_docs, trace_ids=lambda out: [],
+        )
+        for doc in docs["docs"]:
+            safe_write(workspace.root, doc["path"], doc["content"])
+        self.store.set_status(f"{project_id}:DOCS", ArtifactStatus.APPROVED)
+        safe_write(self.workspace_root / project_id, "CHANGELOG.md", self._render_changelog(release))
+        result.new_version = release["version"]
+
+    def _open_workspace(self, project_id: str) -> GitWorkspace:
+        """Handle onto an already-initialized workspace (no re-init)."""
+        root = self.workspace_root / project_id
+        cls = GitWorkspace if GitWorkspace.available() else NullGitWorkspace
+        return cls(root)
+
     # ---------------------------------------------------------- generic step
 
     def _produce(
@@ -341,16 +532,15 @@ class Orchestrator:
             if attempt == 1:
                 self.tracker.record(kind, not defects)
             if not defects:
-                artifact = self.store.put(
+                self.store.put(
                     artifact_id,
                     artifact_type=artifact_type,
                     content=output,
                     created_by=agent.role,
                     project_id=project_id,
                     trace_ids=trace_ids(output),
-                    expected_version=self._versions.get(artifact_id),
+                    expected_version=self._current_version(artifact_id),
                 )
-                self._versions[artifact_id] = artifact.version
                 return output
             feedback = "Validation defects:\n" + "\n".join(f"- {d}" for d in defects)
             self._notify(project_id, stage, f"{kind} rejected by validation: {defects}")
@@ -358,6 +548,25 @@ class Orchestrator:
             f"{kind} for {project_id} failed validation {self.config.max_retries} times; "
             f"last defects: {defects}"
         )
+
+    def _current_version(self, artifact_id: str) -> int | None:
+        try:
+            return self.store.get(artifact_id).version
+        except ArtifactNotFoundError:
+            return None
+
+    def _upsert(self, artifact_id, *, artifact_type, content, created_by, project_id, trace_ids):
+        """Write a new artifact or a new version of an existing one, then approve."""
+        self.store.put(
+            artifact_id,
+            artifact_type=artifact_type,
+            content=content,
+            created_by=created_by,
+            project_id=project_id,
+            trace_ids=trace_ids,
+            expected_version=self._current_version(artifact_id),
+        )
+        self.store.set_status(artifact_id, ArtifactStatus.APPROVED)
 
     # -------------------------------------------------------------- stages
 
@@ -543,36 +752,38 @@ class Orchestrator:
         for index, wbs_id in enumerate(ordered_wbs_ids, start=1):
             item = wbs_items[wbs_id]
             story = stories[item["story_id"]]
-            ticket_id = f"TCK-{index:03d}"
-            components = [
-                c for c in architecture["components"] if item["story_id"] in c["story_ids"]
-            ]
-            ticket = {
-                "ticket_id": ticket_id,
-                "wbs_id": wbs_id,
-                "story_id": item["story_id"],
-                "description": item["description"],
-                "story": story["story"],
-                "acceptance_criteria": story["acceptance_criteria"],
-                "architecture": {
-                    "components": components,
-                    "api_contracts": architecture.get("api_contracts", []),
-                },
-            }
-            self.store.put(
-                f"{project_id}:{ticket_id}",
+            ticket = self._ticket_dict(f"TCK-{index:03d}", item, story, architecture)
+            self._upsert(
+                f"{project_id}:{ticket['ticket_id']}",
                 artifact_type="ticket",
                 content=ticket,
                 created_by="orchestrator",
                 project_id=project_id,
                 trace_ids=[wbs_id, item["story_id"]],
             )
-            self.store.set_status(f"{project_id}:{ticket_id}", ArtifactStatus.APPROVED)
             tickets.append(ticket)
         self._notify(
             project_id, STAGE_BUILD, f"derived {len(tickets)} tickets from the sprint plan"
         )
         return tickets
+
+    @staticmethod
+    def _ticket_dict(ticket_id: str, wbs_item: dict, story: dict, architecture: dict) -> dict:
+        components = [
+            c for c in architecture["components"] if story["id"] in c["story_ids"]
+        ]
+        return {
+            "ticket_id": ticket_id,
+            "wbs_id": wbs_item["id"],
+            "story_id": story["id"],
+            "description": wbs_item["description"],
+            "story": story["story"],
+            "acceptance_criteria": story["acceptance_criteria"],
+            "architecture": {
+                "components": components,
+                "api_contracts": architecture.get("api_contracts", []),
+            },
+        }
 
     def _run_ticket(self, project_id: str, workspace: GitWorkspace, ticket: dict) -> TicketResult:
         ticket_id = ticket["ticket_id"]
@@ -927,7 +1138,7 @@ class Orchestrator:
         )
 
     def _record(self, project_id, artifact_id, artifact_type, content, *, created_by, trace_ids):
-        self.store.put(
+        self._upsert(
             artifact_id,
             artifact_type=artifact_type,
             content=content,
@@ -935,7 +1146,6 @@ class Orchestrator:
             project_id=project_id,
             trace_ids=trace_ids,
         )
-        self.store.set_status(artifact_id, ArtifactStatus.APPROVED)
 
     def _security_step(self, project_id, ticket, workspace, diff, pr):
         """Run scanners, triage findings, return (blocked, report, n_findings).
@@ -1054,9 +1264,8 @@ class Orchestrator:
     ) -> None:
         ticket_id = ticket["ticket_id"]
         ac_ids = [ac["id"] for ac in ticket["acceptance_criteria"]]
-        code_id = f"{project_id}:CODE-{ticket_id}"
-        self.store.put(
-            code_id,
+        self._upsert(
+            f"{project_id}:CODE-{ticket_id}",
             artifact_type="code",
             content={
                 "ticket_id": ticket_id,
@@ -1067,21 +1276,17 @@ class Orchestrator:
             project_id=project_id,
             trace_ids=[ticket_id, ticket["wbs_id"], ticket["story_id"]],
         )
-        self.store.set_status(code_id, ArtifactStatus.APPROVED)
         if review is not None:
-            review_id = f"{project_id}:REVIEW-{ticket_id}"
-            self.store.put(
-                review_id,
+            self._upsert(
+                f"{project_id}:REVIEW-{ticket_id}",
                 artifact_type="review",
                 content={"ticket_id": ticket_id, **review},
                 created_by="reviewer",
                 project_id=project_id,
                 trace_ids=[ticket_id, ticket["story_id"]],
             )
-            self.store.set_status(review_id, ArtifactStatus.APPROVED)
-        qa_id = f"{project_id}:QA-{ticket_id}"
-        self.store.put(
-            qa_id,
+        self._upsert(
+            f"{project_id}:QA-{ticket_id}",
             artifact_type="qa_report",
             content={
                 "ticket_id": ticket_id,
@@ -1094,7 +1299,6 @@ class Orchestrator:
             project_id=project_id,
             trace_ids=[ticket_id, *ac_ids],
         )
-        self.store.set_status(qa_id, ArtifactStatus.APPROVED)
 
     def _init_workspace(self, project_id: str) -> GitWorkspace:
         root = self.workspace_root / project_id
