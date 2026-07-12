@@ -68,6 +68,8 @@ from pm_system import (
     RetrospectiveAgent,
     ReviewerAgent,
     SecurityAgent,
+    render_dashboard,
+    stakeholder_digest,
 )
 from pm_system.config import CHEAP_MODEL, MID_MODEL, STRONG_MODEL
 from pm_system.sandbox.runner import DockerSandbox, LocalSandbox, default_sandbox
@@ -100,6 +102,16 @@ def main(argv=None) -> int:
         action="store_true",
         help="after shipping, feed a prod incident to Ops; an actionable one is "
         "triaged into a fix that re-enters the dev loop (Phase 6)",
+    )
+    parser.add_argument(
+        "--dashboard",
+        action="store_true",
+        help="write an observability dashboard (HTML) to the workspace (Phase 7)",
+    )
+    parser.add_argument(
+        "--digest",
+        action="store_true",
+        help="print a stakeholder digest at the end (Phase 7)",
     )
     args = parser.parse_args(argv)
 
@@ -282,6 +294,15 @@ def main(argv=None) -> int:
             f"calibration multiplier {cal['multiplier']} from {cal['samples']} sample(s) "
             "(fed to the next project's Estimator)"
         )
+
+    if args.dashboard and result.workspace is not None:
+        path = result.workspace / "dashboard.html"
+        path.write_text(render_dashboard(result, ledger, store))
+        print(f"\n=== Observability dashboard ===\nwrote {path}")
+
+    if args.digest:
+        print("\n=== Stakeholder digest ===")
+        print(stakeholder_digest(result, store))
 
     return 0 if result.status == "completed" else 1
 

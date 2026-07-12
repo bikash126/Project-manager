@@ -1,17 +1,36 @@
-# Multi-Agent Software Development PM System — Phases 1–6
+# Multi-Agent Software Development PM System — all 7 phases
 
-Phases 1–6 of the [design document](https://app.notion.com/p/39ad619bbee38114b98cff069085958a):
-a PM Orchestrator plus fifteen specialist agents that take a raw project idea
+The complete [design document](https://app.notion.com/p/39ad619bbee38114b98cff069085958a):
+a PM Orchestrator plus seventeen specialist agents that take a raw project idea
 through the full lifecycle — PRD → backlog/MVP → WBS + estimates → sprint plan
-→ **Gate 1** → architecture/ADRs → **Gate 2** → the per-ticket quality loop
-`Dev → Security → Review → QA` (each ticket a PR) → the ship path (integration
-+ license check → migrations → CI/CD → **Gate 3** → release/deploy → docs) —
-then operates and learns: change requests re-run only their blast radius, prod
-incidents re-enter the dev loop, and a retrospective feeds a Knowledge Base
-that calibrates future estimates. Runs end-to-end on a toy project, on the
-foundations the design requires from day one: a versioned artifact store with a
-status lifecycle, cost ledger, sandbox platform, traceability index, and the
-agent eval harness.
+→ **Gate 1** → architecture/ADRs → **Gate 2** → (optional UX→UI design) → the
+per-ticket quality loop `Dev → Security → Review → QA` (each ticket a PR, built
+in parallel by dependency wave) → the ship path (integration + license check →
+migrations → CI/CD → **Gate 3** → release/deploy → docs) — then operates and
+learns: change requests re-run only their blast radius, prod incidents re-enter
+the dev loop, and a retrospective feeds a Knowledge Base that calibrates future
+estimates. Runs end-to-end on a toy project, on the foundations the design
+requires from day one: a versioned artifact store with a status lifecycle, cost
+ledger, sandbox platform, traceability index, and the agent eval harness.
+
+## What's implemented — Phase 7 (hardening)
+
+| Design element | Where | Notes |
+|---|---|---|
+| UX + UI agents | `pm_system/agents/{ux,ui}.py` | User flows + IA; component specs + design tokens; opt-in design sub-stage after Gate 2 (`enable_design`) feeding UI specs into tickets |
+| Parallel dev by wave | `Orchestrator._build_tickets` / `_dependency_waves` | Independent tickets (same dependency level) build concurrently in isolated git **worktrees** (`parallel_tickets`) |
+| Merge-conflict handling | `_integrate_ticket` / `_resolve_merge_conflict` + `git_workspace.py` | Integration is serialized; a real git conflict is handed to the Developer to reconcile, then re-verified |
+| Observability dashboard | `pm_system/observe/dashboard.py` | Self-contained HTML: metric row, cost by stage/agent, ticket + artifact tables |
+| Stakeholder digest | `pm_system/observe/digest.py` | Non-technical close-out summary; optionally emitted via the notifier (`emit_stakeholder_digest`) |
+| Multi-project concurrency | `pm_system/orchestrator/multi.py` | `run_projects` runs several projects at once, each its own orchestrator, sharing the thread-safe store/ledger/KB |
+| Thread safety | `MockLLM`, `NullPRPublisher`, orchestrator state lock | Shared state guarded so a wave's tickets build concurrently |
+| P3 playbooks | `playbooks/{ux,ui}.md` | Flow spec format; component + design-token rules |
+
+**Phase 7 status:** hardening is "ongoing" per the plan; the above is
+implemented and opt-in (defaults keep Phases 1–6 behavior). Demonstrated in
+`tests/test_phase7_hardening.py` (parallel build, conflict resolution, design
+stage, dashboard, digest, concurrent projects) and via `--dashboard` /
+`--digest` on the toy runner.
 
 ## What's implemented — Phase 6 (operate + learn)
 
@@ -125,10 +144,10 @@ eval suites exist for all four Phase-2 agents (`pm_system/evals/golden.py`).
 | P0 playbooks | `playbooks/{analyst,developer,qa}.md` | Role definition, procedure, template, checklist, failure patterns, escalation rules |
 | Model tiering | `pm_system/config.py`, `pm_system/llm/client.py` | Strong/mid/cheap tiers, per-family pricing for the ledger |
 
-Deliberately **not** built yet: **Phase 7 — hardening** (UX/UI agents,
-parallel dev agents + merge-conflict handling, observability dashboards,
-stakeholder digests, multi-project concurrency). Everything through Phase 6 is
-implemented.
+All seven phases of the build plan are implemented. Phase 7 (hardening) is the
+"ongoing" phase and its features are opt-in via `OrchestratorConfig`
+(`enable_design`, `parallel_tickets`, `emit_stakeholder_digest`) so the default
+configuration reproduces the Phase 1–6 behavior.
 
 ## Exit criteria
 
@@ -150,16 +169,20 @@ implemented.
 - **P6 — prod error auto-triaged into a ticket that re-enters the dev loop;
   retrospective writes KB entries; estimate error shrinks across projects** —
   `--incident`, `kb_entries_written`, `calibration_factor`.
+- **P7 — hardening** — parallel builds by dependency wave with conflict-resolving
+  merges, an optional UX→UI design stage, observability dashboard + stakeholder
+  digest, and concurrent multi-project runs (`tests/test_phase7_hardening.py`).
 
 ## Quickstart
 
 ```bash
 pip install -e ".[dev]"          # + [llm] for Anthropic, + [slack] for Slack
-python -m pytest                 # 139 tests
+python -m pytest                 # 150 tests
 python -m examples.run_toy_project --sandbox local                  # full lifecycle, offline
 python -m examples.run_toy_project --sandbox local --inject-secret  # P3 security gate demo
 python -m examples.run_toy_project --sandbox local --change-request # P5 blast-radius demo
 python -m examples.run_toy_project --sandbox local --incident       # P6 operate-loop demo
+python -m examples.run_toy_project --sandbox local --dashboard --digest  # P7 observability
 
 # eval the planning/review/security agents against real models (gates prompt changes)
 ANTHROPIC_API_KEY=... python -m pm_system.evals.run --role reviewer --role security
@@ -235,25 +258,27 @@ internal networks have no external route.
 
 ```
 pm_system/
-  orchestrator/   state machine, validation, git workspace, PR publisher, deploy,
-                  change requests (CR flow), incidents (operate loop)
-  agents/         base + the 15 roles (analyst, PO, estimator, planner, architect,
+  orchestrator/   state machine, validation, git workspace (+ worktrees),
+                  PR publisher, deploy, change requests (CR flow),
+                  incidents (operate loop), multi-project runner
+  agents/         base + the 17 roles (analyst, PO, estimator, planner, architect,
                   developer, reviewer, security, qa, data_engineer, devops,
-                  release_manager, doc_writer, ops, retrospective)
+                  release_manager, doc_writer, ops, retrospective, ux, ui)
   artifacts/      versioned store with status lifecycle + traceability index
   costs/          cost ledger + budget caps
   llm/            Anthropic/mock clients, metering, pricing
   sandbox/        Docker/local runners, egress policy + proxy, test runner
   security/       deterministic scanners (SAST/secrets/deps) + license compliance
   kb/             Knowledge Base: calibration, ADRs, failure patterns, lessons
+  observe/        observability dashboard + stakeholder digest
   gates/          Slack/console/auto human gates
   notify/         stage-transition digests (console/Slack)
   evals/          eval harness, golden suites, real-model runner
-playbooks/        one per role (15)
+playbooks/        one per role (17)
 standards/        coding_standards.md (KB standards doc for the Reviewer)
 sandbox/          Dockerfile for the task image (+ security stack)
 examples/         toy project runner + scripted mock responses
-tests/            unit + end-to-end suite (139 tests)
+tests/            unit + end-to-end suite (150 tests)
 ```
 
 Storage is SQLite behind Postgres-shaped interfaces; swapping the backend

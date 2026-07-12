@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Protocol, Sequence
@@ -104,16 +105,18 @@ class MockLLM:
             raise ValueError("pass exactly one of responses / handler")
         self._queue = deque(responses or [])
         self._handler = handler
+        self._lock = threading.Lock()  # parallel tickets may share one agent
         self.calls: list[tuple[str, str]] = []
 
     def complete(self, *, system: str, prompt: str, model: str, max_tokens: int = 8192) -> LLMResponse:
-        self.calls.append((system, prompt))
-        if self._handler is not None:
-            text = self._handler(system, prompt)
-        else:
-            if not self._queue:
+        with self._lock:
+            self.calls.append((system, prompt))
+            if self._handler is not None:
+                text = self._handler(system, prompt)
+            elif not self._queue:
                 raise RuntimeError("MockLLM response queue exhausted")
-            text = self._queue.popleft()
+            else:
+                text = self._queue.popleft()
         return LLMResponse(
             text=text,
             input_tokens=max(1, (len(system) + len(prompt)) // 4),

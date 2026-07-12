@@ -14,6 +14,7 @@ merges it when Review+QA pass (or closes it on escalation).
 from __future__ import annotations
 
 import json
+import threading
 import urllib.request
 from dataclasses import dataclass, field
 
@@ -56,11 +57,13 @@ class NullPRPublisher(PRPublisher):
     def __init__(self):
         self.prs: list[PullRequest] = []
         self._next = 1
+        self._lock = threading.Lock()  # parallel tickets open PRs concurrently
 
     def open_pr(self, *, ticket_id, branch, title, body) -> PullRequest:
-        pr = PullRequest(number=self._next, ticket_id=ticket_id, branch=branch, title=title)
-        self._next += 1
-        self.prs.append(pr)
+        with self._lock:
+            pr = PullRequest(number=self._next, ticket_id=ticket_id, branch=branch, title=title)
+            self._next += 1
+            self.prs.append(pr)
         return pr
 
     def post_verdict(self, pr: PullRequest, verdict: Verdict) -> None:

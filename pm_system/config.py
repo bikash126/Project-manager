@@ -38,3 +38,7 @@ class OrchestratorConfig:
     cr_gate_threshold_points: int = 5  # a change delta above this goes to a human gate
     # Phase 6 operate + learn
     enable_retrospective: bool = True  # write KB entries at project close (needs a KB)
+    # Phase 7 hardening (opt-in / ongoing)
+    enable_design: bool = False  # run UX -> UI design sub-stage after Gate 2
+    parallel_tickets: bool = False  # build independent tickets concurrently by wave
+    emit_stakeholder_digest: bool = False  # emit a stakeholder digest at project close

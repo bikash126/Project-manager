@@ -38,6 +38,11 @@ run into the Knowledge Base (estimate-vs-actual calibration, failure patterns,
 reusable ADRs, lessons), which the Estimator and Architect read on the next
 project.
 
+Hardening (Phase 7, opt-in): an optional UX->UI design sub-stage after Gate 2;
+parallel ticket builds by dependency wave (isolated git worktrees) with
+serialized, conflict-resolving merges; a stakeholder digest at close; and an
+observability dashboard. Multi-project concurrency lives in orchestrator/multi.
+
 The orchestrator never writes code, designs, or docs itself; it curates
 context packages, validates outputs, enforces gates/retries/budgets/context
 caps, and emits a status digest on every stage transition.
@@ -45,6 +50,8 @@ caps, and emits a status digest on every stage transition.
 
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -65,6 +72,8 @@ from pm_system.agents.release_manager import ReleaseManagerAgent
 from pm_system.agents.retrospective import RetrospectiveAgent
 from pm_system.agents.reviewer import ReviewerAgent
 from pm_system.agents.security import SecurityAgent
+from pm_system.agents.ui import UIAgent
+from pm_system.agents.ux import UXAgent
 from pm_system.artifacts.store import Artifact, ArtifactStatus, ArtifactStore
 from pm_system.config import OrchestratorConfig
 from pm_system.costs.ledger import CostLedger
@@ -90,7 +99,9 @@ from pm_system.orchestrator.deploy import Deployer, NullDeployer
 from pm_system.orchestrator.git_workspace import GitWorkspace, NullGitWorkspace
 from pm_system.orchestrator.incident import IncidentResult, ProdIncident
 from pm_system.orchestrator.pr import NullPRPublisher, PRPublisher, Verdict
+from pm_system.observe.digest import stakeholder_digest
 from pm_system.orchestrator.validation import (
+    is_safe_relative_path,
     safe_write,
     topological_order,
     validate_architecture,
@@ -105,6 +116,8 @@ from pm_system.orchestrator.validation import (
     validate_review,
     validate_security_triage,
     validate_sprint_plan,
+    validate_ui,
+    validate_ux,
     validate_wbs,
 )
 from pm_system.sandbox.runner import Sandbox, TestRunner
@@ -214,6 +227,8 @@ class Orchestrator:
         doc_writer: DocWriterAgent | None = None,
         ops: OpsAgent | None = None,
         retrospective_agent: RetrospectiveAgent | None = None,
+        ux: UXAgent | None = None,
+        ui: UIAgent | None = None,
         scan_suite: SecurityScanSuite | None = None,
         license_checker: LicenseChecker | None = None,
         pr_publisher: PRPublisher | None = None,
@@ -255,6 +270,8 @@ class Orchestrator:
                 raise ValueError(
                     f"enable_ship is set but these agents were not provided: {', '.join(missing)}"
                 )
+        if self.config.enable_design and (ux is None or ui is None):
+            raise ValueError("enable_design is set but the ux/ui agents were not provided")
 
         self.store = store
         self.ledger = ledger
@@ -273,6 +290,8 @@ class Orchestrator:
         self.doc_writer = doc_writer
         self.ops = ops
         self.retrospective_agent = retrospective_agent
+        self.ux = ux
+        self.ui = ui
         self.scan_suite = scan_suite or SecurityScanSuite()
         self.license_checker = license_checker or LicenseChecker()
         self.pr_publisher = pr_publisher or NullPRPublisher()
@@ -293,6 +312,7 @@ class Orchestrator:
         self._interventions = 0
         self._deployments: dict[str, object] = {}  # project_id -> latest Deployment
         self._lessons: list[str] = []  # within-project lessons buffer (design §6)
+        self._state_lock = threading.Lock()  # guards shared state under parallel dev
 
     # ------------------------------------------------------------------ api
 
@@ -305,19 +325,13 @@ class Orchestrator:
             result.prd_artifact_id = f"{project_id}:PRD"
             planning = self._planning_with_gate1(project_id, prd, constraints)
             architecture = self._architecture_with_gate2(project_id, prd, planning, constraints)
+            design = self._design_stage(project_id, prd, planning)
 
-            tickets = self._derive_tickets(project_id, prd, planning, architecture)
+            tickets = self._derive_tickets(project_id, prd, planning, architecture, design)
             workspace = self._init_workspace(project_id)
             result.workspace = workspace.root
 
-            for ticket in tickets:
-                ticket_result = self._run_ticket(project_id, workspace, ticket)
-                result.tickets.append(ticket_result)
-                if ticket_result.status == "escalated":
-                    result.escalations.append(
-                        f"{ticket_result.ticket_id} escalated after "
-                        f"{ticket_result.attempts} attempts: {ticket_result.detail[:500]}"
-                    )
+            self._build_tickets(project_id, workspace, tickets, result)
 
             if any(t.status == "escalated" for t in result.tickets):
                 # A broken build is not shippable — skip the ship path.
@@ -466,7 +480,8 @@ class Orchestrator:
                 trace_ids=[content["wbs_id"], content["story_id"]],
             )
             self._notify(project_id, "change", f"re-running {ticket['ticket_id']} for {cr.cr_id}")
-            ticket_result = self._run_ticket(project_id, workspace, ticket)
+            _, ticket_result, wt, pr = self._process_ticket(project_id, workspace, ticket)
+            self._integrate_ticket(project_id, workspace, ticket, ticket_result, wt, pr)
             result.rerun_tickets.append(ticket_result)
             if ticket_result.status == "escalated":
                 result.decision = "escalated"
@@ -970,11 +985,12 @@ class Orchestrator:
         )
 
     def _derive_tickets(
-        self, project_id: str, prd: dict, planning: dict, architecture: dict
+        self, project_id: str, prd: dict, planning: dict, architecture: dict, design: dict | None = None
     ) -> list[dict]:
         """Mechanical derivation: one ticket per WBS item, in sprint order,
         dependency-respecting within each sprint, with the architecture slices
-        relevant to the ticket's story attached (context curation)."""
+        (and UI component specs, if a design stage ran) relevant to the ticket's
+        story attached (context curation)."""
         stories = {s["id"]: s for s in prd["user_stories"]}
         wbs_items = {item["id"]: item for item in planning["wbs"]["wbs_items"]}
         deps = planning["plan"]["dependencies"]
@@ -987,7 +1003,7 @@ class Orchestrator:
         for index, wbs_id in enumerate(ordered_wbs_ids, start=1):
             item = wbs_items[wbs_id]
             story = stories[item["story_id"]]
-            ticket = self._ticket_dict(f"TCK-{index:03d}", item, story, architecture)
+            ticket = self._ticket_dict(f"TCK-{index:03d}", item, story, architecture, design)
             self._upsert(
                 f"{project_id}:{ticket['ticket_id']}",
                 artifact_type="ticket",
@@ -1003,11 +1019,11 @@ class Orchestrator:
         return tickets
 
     @staticmethod
-    def _ticket_dict(ticket_id: str, wbs_item: dict, story: dict, architecture: dict) -> dict:
+    def _ticket_dict(ticket_id, wbs_item, story, architecture, design=None) -> dict:
         components = [
             c for c in architecture["components"] if story["id"] in c["story_ids"]
         ]
-        return {
+        ticket = {
             "ticket_id": ticket_id,
             "wbs_id": wbs_item["id"],
             "story_id": story["id"],
@@ -1019,24 +1035,215 @@ class Orchestrator:
                 "api_contracts": architecture.get("api_contracts", []),
             },
         }
+        if design:
+            flow_ids = {f["id"] for f in design["ux"]["flows"] if story["id"] in f["story_ids"]}
+            ui_components = [
+                c for c in design["ui"]["components"] if set(c["used_in"]) & flow_ids
+            ]
+            if ui_components:
+                ticket["design"] = {
+                    "components": ui_components,
+                    "design_tokens": design["ui"]["design_tokens"],
+                }
+        return ticket
 
-    def _run_ticket(self, project_id: str, workspace: GitWorkspace, ticket: dict) -> TicketResult:
+    def _design_stage(self, project_id: str, prd: dict, planning: dict) -> dict | None:
+        """UX -> UI design sub-stage (Phase 7). Returns None when disabled."""
+        if not self.config.enable_design:
+            return None
+        mvp_ids = set(planning["backlog"]["mvp_story_ids"])
+        mvp_stories = [s for s in prd["user_stories"] if s["id"] in mvp_ids]
+
+        ux = self._produce(
+            project_id=project_id, kind="ux", stage="ux", agent=self.ux,
+            artifact_id=f"{project_id}:UX", artifact_type="ux",
+            instructions=(
+                "Design the user flows, wireframe steps, and information architecture "
+                "for the MVP stories. Every MVP story must appear in a flow."
+            ),
+            artifacts={"mvp_user_stories": mvp_stories},
+            validate=lambda out: validate_ux(out, mvp_ids),
+            trace_ids=lambda out: sorted(mvp_ids),
+        )
+        self.store.set_status(f"{project_id}:UX", ArtifactStatus.APPROVED)
+
+        flow_ids = {f["id"] for f in ux["flows"]}
+        ui = self._produce(
+            project_id=project_id, kind="ui", stage="ui", agent=self.ui,
+            artifact_id=f"{project_id}:UI", artifact_type="ui",
+            instructions=(
+                "Produce component specs and design tokens for the UX flows below. "
+                "Each component names the flows it is used in."
+            ),
+            artifacts={"ux_flows": ux["flows"], "information_architecture": ux["information_architecture"]},
+            validate=lambda out: validate_ui(out, flow_ids),
+            trace_ids=lambda out: sorted(flow_ids),
+        )
+        self.store.set_status(f"{project_id}:UI", ArtifactStatus.APPROVED)
+        self._notify(project_id, "ui", f"design produced: {len(ux['flows'])} flows, "
+                     f"{len(ui['components'])} components")
+        return {"ux": ux, "ui": ui}
+
+    def _build_tickets(self, project_id, workspace, tickets, result: ProjectResult) -> None:
+        """Run the tickets, optionally in parallel by dependency wave (Phase 7).
+
+        Tickets in the same wave have no dependency between them, so they build
+        concurrently in isolated worktrees; integration (merge into main) is
+        always serialized, with merge-conflict resolution.
+        """
+        parallel = self.config.parallel_tickets and workspace.isolates
+        waves = self._dependency_waves(project_id, tickets) if parallel else [[t] for t in tickets]
+
+        for wave in waves:
+            if parallel and len(wave) > 1:
+                self._notify(
+                    project_id, STAGE_BUILD,
+                    f"building {len(wave)} tickets in parallel: "
+                    f"{', '.join(t['ticket_id'] for t in wave)}",
+                )
+                with ThreadPoolExecutor(max_workers=len(wave)) as pool:
+                    processed = list(pool.map(
+                        lambda t: self._process_ticket(project_id, workspace, t), wave
+                    ))
+            else:
+                processed = [self._process_ticket(project_id, workspace, t) for t in wave]
+
+            # Serialized integration: merge each built ticket into main in order.
+            for ticket, ticket_result, wt, pr in processed:
+                self._integrate_ticket(project_id, workspace, ticket, ticket_result, wt, pr)
+                result.tickets.append(ticket_result)
+                if ticket_result.status == "escalated":
+                    result.escalations.append(
+                        f"{ticket_result.ticket_id} escalated after "
+                        f"{ticket_result.attempts} attempts: {ticket_result.detail[:500]}"
+                    )
+
+    def _dependency_waves(self, project_id, tickets) -> list[list[dict]]:
+        """Group tickets into dependency levels (level 0 = no prerequisites)."""
+        try:
+            deps = self.store.get(f"{project_id}:PLAN").content["dependencies"]
+        except (ArtifactNotFoundError, KeyError):
+            deps = []
+        by_wbs = {t["wbs_id"]: t for t in tickets}
+        # "from" depends on "to": blockers[X] = {Y, ...}
+        blockers: dict[str, set[str]] = {t["wbs_id"]: set() for t in tickets}
+        for dep in deps:
+            if dep["from"] in by_wbs and dep["to"] in by_wbs:
+                blockers[dep["from"]].add(dep["to"])
+
+        level: dict[str, int] = {}
+
+        def compute(node, seen):
+            if node in level:
+                return level[node]
+            if node in seen:  # cycle guard
+                return 0
+            seen = seen | {node}
+            lvl = 0
+            for b in blockers[node]:
+                lvl = max(lvl, compute(b, seen) + 1)
+            level[node] = lvl
+            return lvl
+
+        for wbs_id in by_wbs:
+            compute(wbs_id, set())
+
+        waves: dict[int, list[dict]] = {}
+        for t in tickets:  # preserve derivation order within a wave
+            waves.setdefault(level[t["wbs_id"]], []).append(t)
+        return [waves[k] for k in sorted(waves)]
+
+    def _process_ticket(self, project_id, workspace, ticket):
+        """Create an isolated worktree + PR and build the ticket (no merge)."""
         ticket_id = ticket["ticket_id"]
-        branch = f"ticket/{ticket_id}"
-        ac_ids = {ac["id"] for ac in ticket["acceptance_criteria"]}
-        workspace.start_ticket_branch(branch)
+        wt = workspace.create_worktree(f"ticket/{ticket_id}")
         pr = self.pr_publisher.open_pr(
             ticket_id=ticket_id,
-            branch=branch,
+            branch=wt.branch,
             title=f"{ticket_id}: {ticket['story']}",
             body=f"Implements {ticket['story_id']} / {ticket['wbs_id']}.\n\n{ticket['description']}",
         )
+        ticket_result = self._run_ticket(project_id, wt, ticket, pr)
+        return ticket, ticket_result, wt, pr
+
+    def _integrate_ticket(self, project_id, workspace, ticket, result, wt, pr) -> None:
+        """Serialized merge of a built ticket into main, with conflict handling."""
+        if result.status != "passed":
+            self.pr_publisher.close_pr(pr, f"escalated after {result.attempts} attempt(s)")
+            workspace.remove_worktree(wt)
+            self._notify(
+                project_id, STAGE_BUILD,
+                f"{result.ticket_id} ESCALATED (PR #{pr.number} closed, branch {wt.branch} kept)",
+            )
+            return
+
+        merge = workspace.merge(wt.branch)
+        if not merge.ok:
+            self._notify(
+                project_id, STAGE_BUILD,
+                f"{result.ticket_id} merge conflict in {merge.conflicted_files}; resolving",
+            )
+            if not self._resolve_merge_conflict(project_id, ticket, workspace, merge):
+                workspace.abort_merge()
+                self.pr_publisher.close_pr(pr, "unresolved merge conflict")
+                workspace.remove_worktree(wt)
+                self._escalate_ticket(
+                    result, f"unresolved merge conflict in {merge.conflicted_files}"
+                )
+                return
+
+        self.pr_publisher.merge_pr(pr)
+        workspace.remove_worktree(wt)
+        self._notify(project_id, STAGE_BUILD, f"{result.ticket_id} merged into main (PR #{pr.number})")
+
+    def _resolve_merge_conflict(self, project_id, ticket, workspace, merge) -> bool:
+        """Ask the Developer to reconcile conflicted files, then verify tests.
+
+        Returns True if the merge was completed and the suite is green.
+        """
+        conflicts = {}
+        for path in merge.conflicted_files:
+            try:
+                conflicts[path] = (workspace.root / path).read_text()
+            except OSError:
+                conflicts[path] = ""
+        try:
+            resolution = self.developer.run(
+                ContextPackage(
+                    instructions=(
+                        f"Resolve the git merge conflicts for ticket {ticket['ticket_id']}. "
+                        "The files below contain conflict markers (<<<<<<< ======= >>>>>>>). "
+                        "Return the fully merged file contents with all markers removed, "
+                        "preserving the intent of both sides."
+                    ),
+                    artifacts={"conflicted_files": conflicts, "ticket": ticket},
+                ),
+                CostTags(project_id=project_id, stage=STAGE_BUILD, agent="developer",
+                         ticket_id=ticket["ticket_id"]),
+            )
+        except (AgentOutputError, ContextOverflowError):
+            return False
+        for file in resolution.get("files", []):
+            if is_safe_relative_path(file["path"]):
+                safe_write(workspace.root, file["path"], file["content"])
+        workspace.complete_merge(f"merge {ticket['ticket_id']} (conflicts resolved)")
+        return self.test_runner.run(workspace.root).passed
+
+    def _run_ticket(self, project_id, wt, ticket, pr) -> TicketResult:
+        """Build one ticket in its own worktree through Dev->Security->Review->QA.
+
+        On success the work is committed on the ticket branch (NOT merged) and
+        artifacts recorded; the caller integrates (merges) serially. This lets a
+        wave of independent tickets run in parallel worktrees safely.
+        """
+        ticket_id = ticket["ticket_id"]
+        ac_ids = {ac["id"] for ac in ticket["acceptance_criteria"]}
         result = TicketResult(
             ticket_id=ticket_id,
             story_id=ticket["story_id"],
             status="escalated",
             attempts=0,
-            branch=branch,
+            branch=wt.branch,
             pr_number=pr.number,
         )
         dev_feedback: str | None = None
@@ -1061,7 +1268,7 @@ class Orchestrator:
                         ),
                         artifacts={
                             "ticket": ticket,
-                            "workspace_files": self._list_workspace(workspace.root),
+                            "workspace_files": self._list_workspace(wt.root),
                         },
                         # Within-project lessons buffer: what earlier tickets
                         # tripped over, so this one avoids it (design §6).
@@ -1073,8 +1280,7 @@ class Orchestrator:
             except AgentOutputError as exc:
                 defects = exc.defects
             except ContextOverflowError as exc:
-                return self._escalate_ticket(project_id, workspace, pr, result,
-                                             f"context cap exceeded: {exc}")
+                return self._escalate_ticket(result, f"context cap exceeded: {exc}")
             if dev_out is not None:
                 defects = defects + validate_dev_output(dev_out, ticket_id)
             if attempt == 1:
@@ -1085,9 +1291,9 @@ class Orchestrator:
                 continue
 
             for file in dev_out["files"]:
-                safe_write(workspace.root, file["path"], file["content"])
+                safe_write(wt.root, file["path"], file["content"])
 
-            unit = self.test_runner.run(workspace.root)
+            unit = self.test_runner.run(wt.root)
             if not unit.passed:
                 last_failure = f"Unit test run failed (exit {unit.exit_code}):\n{unit.summary}"
                 dev_feedback = last_failure
@@ -1100,7 +1306,7 @@ class Orchestrator:
             if self.config.enable_security:
                 try:
                     blocked, security_report, n_findings = self._security_step(
-                        project_id, ticket, workspace, diff, pr
+                        project_id, ticket, wt, diff, pr
                     )
                 except ContextOverflowError as exc:
                     return self._escalate_ticket(project_id, workspace, pr, result,
@@ -1119,8 +1325,7 @@ class Orchestrator:
                 try:
                     review = self._review_step(project_id, ticket_id, diff, pr, attempt)
                 except ContextOverflowError as exc:
-                    return self._escalate_ticket(project_id, workspace, pr, result,
-                                                 f"context cap exceeded: {exc}")
+                    return self._escalate_ticket(result, f"context cap exceeded: {exc}")
                 if review is None:  # invalid review output; burn attempt
                     last_failure = "Reviewer output was invalid"
                     continue
@@ -1155,8 +1360,7 @@ class Orchestrator:
             except AgentOutputError as exc:
                 qa_defects = exc.defects
             except ContextOverflowError as exc:
-                return self._escalate_ticket(project_id, workspace, pr, result,
-                                             f"context cap exceeded: {exc}")
+                return self._escalate_ticket(result, f"context cap exceeded: {exc}")
             if qa_out is not None:
                 qa_defects = qa_defects + validate_qa_output(qa_out, ticket_id, ac_ids)
             if attempt == 1:
@@ -1168,9 +1372,9 @@ class Orchestrator:
                 continue
 
             for file in qa_out["test_files"]:
-                safe_write(workspace.root, file["path"], file["content"])
+                safe_write(wt.root, file["path"], file["content"])
 
-            acceptance = self.test_runner.run(workspace.root)
+            acceptance = self.test_runner.run(wt.root)
             if not acceptance.passed:
                 result.qa_failures += 1
                 last_failure = (
@@ -1184,11 +1388,10 @@ class Orchestrator:
                 self._notify(project_id, STAGE_QA, f"{ticket_id} acceptance tests failed")
                 continue
 
-            # --- all gates green
-            workspace.commit_all(f"{ticket_id}: implement {ticket['story_id']}")
-            workspace.merge_ticket_branch(branch)
+            # --- all gates green: commit on the ticket branch (merge is the
+            # caller's serialized job so a wave can run in parallel).
+            wt.commit_all(f"{ticket_id}: implement {ticket['story_id']}")
             self.pr_publisher.post_verdict(pr, Verdict("qa", "pass"))
-            self.pr_publisher.merge_pr(pr)
             self._record_ticket_artifacts(
                 project_id, ticket, dev_out, qa_out, acceptance.summary,
                 review=passed_review,
@@ -1196,11 +1399,11 @@ class Orchestrator:
             result.status = "passed"
             self._notify(
                 project_id, STAGE_QA,
-                f"{ticket_id} passed Review+QA on attempt {attempt}; PR #{pr.number} merged",
+                f"{ticket_id} passed Review+QA on attempt {attempt}",
             )
             return result
 
-        return self._escalate_ticket(project_id, workspace, pr, result, last_failure)
+        return self._escalate_ticket(result, last_failure)
 
     # ---------------------------------------------------------- ship path
 
@@ -1387,14 +1590,14 @@ class Orchestrator:
             trace_ids=trace_ids,
         )
 
-    def _security_step(self, project_id, ticket, workspace, diff, pr):
+    def _security_step(self, project_id, ticket, wt, diff, pr):
         """Run scanners, triage findings, return (blocked, report, n_findings).
 
         Zero findings -> pass without invoking the model (cost control).
         A confirmed finding at/above the blocking severity blocks (D7).
         """
         ticket_id = ticket["ticket_id"]
-        scan = self.scan_suite.scan(workspace.root, self.test_runner.sandbox,
+        scan = self.scan_suite.scan(wt.root, self.test_runner.sandbox,
                                     timeout=self.config.sandbox_timeout)
         if not scan.has_findings:
             self.pr_publisher.post_verdict(pr, Verdict("security", "pass", "no findings"))
@@ -1485,23 +1688,19 @@ class Orchestrator:
 
     def _remember_lesson(self, lesson: str) -> None:
         """Append to the within-project lessons buffer (deduped, capped)."""
-        if lesson not in self._lessons:
-            self._lessons.append(lesson)
-            del self._lessons[:-20]  # keep the buffer bounded
+        with self._state_lock:
+            if lesson not in self._lessons:
+                self._lessons.append(lesson)
+                del self._lessons[:-20]  # keep the buffer bounded
 
-    def _escalate_ticket(self, project_id, workspace, pr, result: TicketResult, detail) -> TicketResult:
-        workspace.abandon_ticket_branch(result.branch)
-        self.pr_publisher.close_pr(pr, f"escalated after {result.attempts} attempt(s)")
+    def _escalate_ticket(self, result: TicketResult, detail) -> TicketResult:
+        """Mark a ticket escalated. The caller closes the PR / cleans the
+        worktree during integration (this may run on a worker thread)."""
         result.status = "escalated"
         result.detail = detail
-        self._interventions += 1  # a human now owns this ticket
+        with self._state_lock:
+            self._interventions += 1  # a human now owns this ticket
         self._remember_lesson(f"{result.ticket_id} escalated: {detail[:120]}")
-        self._notify(
-            project_id,
-            STAGE_BUILD,
-            f"{result.ticket_id} ESCALATED to human after {result.attempts} attempt(s) "
-            f"(PR #{pr.number} closed, WIP left on {result.branch})",
-        )
         return result
 
     # ------------------------------------------------------------- helpers
@@ -1556,7 +1755,7 @@ class Orchestrator:
         (root / "tests" / ".gitkeep").write_text("")
         # A root conftest puts the workspace on sys.path so tests import the code.
         (root / "conftest.py").write_text("")
-        (root / ".gitignore").write_text("__pycache__/\n.pytest_cache/\n")
+        (root / ".gitignore").write_text("__pycache__/\n.pytest_cache/\n.worktrees/\n")
         (root / "README.md").write_text(f"# {project_id}\n\nBuilt by the PM system.\n")
         workspace.commit_all("chore: scaffold workspace")
         return workspace
@@ -1639,6 +1838,10 @@ class Orchestrator:
             f"total cost ${result.total_cost_usd:.4f}; "
             f"per stage: {self.ledger.summary(result.project_id)}",
         )
+        if self.config.emit_stakeholder_digest:
+            self.notifier.notify(
+                result.project_id, "digest", stakeholder_digest(result, self.store)
+            )
         return result
 
     def _notify(self, project_id: str, stage: str, message: str) -> None:

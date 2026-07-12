@@ -259,6 +259,39 @@ def validate_security_triage(output: dict, finding_ids: set[str]) -> list[str]:
     return defects
 
 
+def validate_ux(output: dict, mvp_story_ids: set[str]) -> list[str]:
+    defects: list[str] = []
+    flow_ids = [f["id"] for f in output.get("flows", [])]
+    if len(flow_ids) != len(set(flow_ids)):
+        defects.append("duplicate flow ids")
+    covered: set[str] = set()
+    for flow in output.get("flows", []):
+        covered.update(flow["story_ids"])
+    unknown = sorted(covered - mvp_story_ids)
+    if unknown:
+        defects.append(f"flows reference stories outside MVP scope: {', '.join(unknown)}")
+    missing = sorted(mvp_story_ids - covered)
+    if missing:
+        defects.append(f"no flow covers MVP stories: {', '.join(missing)}")
+    return defects
+
+
+def validate_ui(output: dict, flow_ids: set[str]) -> list[str]:
+    defects: list[str] = []
+    names = [c["name"] for c in output.get("components", [])]
+    if len(names) != len(set(names)):
+        defects.append("duplicate component names")
+    for component in output.get("components", []):
+        unknown = sorted(set(component["used_in"]) - flow_ids)
+        if unknown:
+            defects.append(
+                f"component {component['name']!r} references unknown flows: {', '.join(unknown)}"
+            )
+    if not output.get("design_tokens", {}).get("colors"):
+        defects.append("design_tokens must define at least one color")
+    return defects
+
+
 def validate_data_engineering(output: dict) -> list[str]:
     defects: list[str] = []
     ids = [m["id"] for m in output.get("migrations", [])]
